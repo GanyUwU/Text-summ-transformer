@@ -29,6 +29,66 @@ except ImportError:
     plt = None
 
 
+def _num_heads(attn_block):
+    if hasattr(attn_block, "num_heads"):
+        return int(attn_block.num_heads)
+    if hasattr(attn_block, "h"):
+        return int(attn_block.h)
+    if hasattr(attn_block, "n_heads"):
+        return int(attn_block.n_heads)
+    raise AttributeError("Attention block has no head-count attribute (num_heads/h/n_heads).")
+
+
+def get_qkv(attn_block, x):
+    if hasattr(attn_block, "w_q"):
+        q = attn_block.w_q(x)
+        k = attn_block.w_k(x)
+        v = attn_block.w_v(x)
+    elif hasattr(attn_block, "linear_q"):
+        q = attn_block.linear_q(x)
+        k = attn_block.linear_k(x)
+        v = attn_block.linear_v(x)
+    elif hasattr(attn_block, "q_proj"):
+        q = attn_block.q_proj(x)
+        k = attn_block.k_proj(x)
+        v = attn_block.v_proj(x)
+    else:
+        raise AttributeError("No Q/K/V projections found in attention block.")
+    return q, k, v
+
+
+def to_bhtd(t, x_ref, attn_block, name="tensor"):
+    """
+    Normalize projected Q/K/V tensor to shape (B, H, T, Dk).
+    Supports (B,T,D), (T,B,D), (B,H,T,Dk), (B,T,H,Dk).
+    """
+    h = _num_heads(attn_block)
+
+    if t.ndim == 3:
+        if t.shape[0] == x_ref.shape[0] and t.shape[1] == x_ref.shape[1]:
+            btd = t
+        elif t.shape[0] == x_ref.shape[1] and t.shape[1] == x_ref.shape[0]:
+            btd = t.transpose(0, 1)
+        else:
+            raise RuntimeError(
+                f"{name} shape {tuple(t.shape)} does not align with reference {tuple(x_ref.shape)}"
+            )
+        B, T, D = btd.shape
+        if D % h != 0:
+            raise RuntimeError(f"{name} last dim {D} not divisible by num_heads={h}")
+        d_k = D // h
+        return btd.contiguous().view(B, T, h, d_k).transpose(1, 2).contiguous()
+
+    if t.ndim == 4:
+        if t.shape[1] == h:
+            return t.contiguous()
+        if t.shape[2] == h:
+            return t.permute(0, 2, 1, 3).contiguous()
+        raise RuntimeError(f"{name} 4D shape {tuple(t.shape)} does not contain head axis={h}")
+
+    raise RuntimeError(f"{name} unsupported rank {t.ndim}; expected 3D/4D")
+
+
 def encode_sentence(model, tokenizer, text, device):
     """Encode a sentence and return encoder output + attention details."""
     tokens = tokenizer.encode(text)
@@ -242,17 +302,10 @@ def test_attention_specialization(model, tokenizer, device):
                     sa = layer.self_attention_block
                     
                     # Compute Q, K, V
-                    q = sa.w_q(x)  # (B, T, d_model)
-                    k = sa.w_k(x)
-                    v = sa.w_v(x)
-                    
-                    B, T, d_model = q.shape
-                    h = sa.h
-                    d_k = d_model // h
-                    
-                    # Reshape to (B, h, T, d_k)
-                    q = q.view(B, T, h, d_k).transpose(1, 2)
-                    k = k.view(B, T, h, d_k).transpose(1, 2)
+                    q, k, v = get_qkv(sa, x)
+                    q = to_bhtd(q, x, sa, name="q")
+                    k = to_bhtd(k, x, sa, name="k")
+                    d_k = q.shape[-1]
                     
                     # Compute attention scores
                     attn = torch.matmul(q, k.transpose(-2, -1)) / (d_k ** 0.5)

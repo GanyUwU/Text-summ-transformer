@@ -10,14 +10,20 @@ class LayerNormalization(nn.Module):
         self.alpha = nn.Parameter(torch.ones(features)) # alpha is a learnable parameter
         self.bias = nn.Parameter(torch.zeros(features)) # bias is a learnable parameter
 
+    # def forward(self, x):
+    #     # x: (batch, seq_len, hidden_size)
+    #      # Keep the dimension for broadcasting
+    #     mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
+    #     # Keep the dimension for broadcasting
+    #     std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
+    #     # eps is to prevent dividing by zero or when std is very small
+    #     return self.alpha * (x - mean) / (std + self.eps) + self.bias
     def forward(self, x):
-        # x: (batch, seq_len, hidden_size)
-         # Keep the dimension for broadcasting
-        mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        # Keep the dimension for broadcasting
-        std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        # eps is to prevent dividing by zero or when std is very small
-        return self.alpha * (x - mean) / (std + self.eps) + self.bias
+        # x: (B, T, D)
+        mean = x.mean(dim=-1, keepdim=True)
+        var  = x.var(dim=-1, keepdim=True, unbiased=False)   # stable population variance
+        xhat = (x - mean) / torch.sqrt(var + self.eps)
+        return self.alpha * xhat + self.bias
 
 class FeedForwardBlock(nn.Module):
 
@@ -88,82 +94,195 @@ class ResidualConnection(nn.Module):
         def forward(self, x, sublayer):
             return x + self.dropout(sublayer(self.norm(x)))
 
+# class MultiHeadAttentionBlock(nn.Module):
+
+#     def __init__(self, d_model: int, h: int, dropout: float) -> None:
+#         super().__init__()
+#         self.d_model = d_model # Embedding vector size
+#         self.h = h # Number of heads
+#         # Make sure d_model is divisible by h
+#         assert d_model % h == 0, "d_model is not divisible by h"
+
+#         self.d_k = d_model // h # Dimension of vector seen by each head
+#         self.w_q = nn.Linear(d_model, d_model, bias=False) # Wq
+#         self.w_k = nn.Linear(d_model, d_model, bias=False) # Wk
+#         self.w_v = nn.Linear(d_model, d_model, bias=False) # Wv
+#         self.w_o = nn.Linear(d_model, d_model, bias=False) # Wo
+        
+#         # Layer normalization for Q and K to prevent attention score collapse
+#         self.ln_q = nn.LayerNorm(d_model)
+#         self.ln_k = nn.LayerNorm(d_model)
+        
+#         self.dropout = nn.Dropout(dropout)
+        
+#         # Initialize attention projections with Xavier/Glorot for better convergence
+#         nn.init.xavier_uniform_(self.w_q.weight)
+#         nn.init.xavier_uniform_(self.w_k.weight)
+#         nn.init.xavier_uniform_(self.w_v.weight)
+#         nn.init.xavier_uniform_(self.w_o.weight)
+
+#     @staticmethod
+#     def attention(query, key, value, mask, dropout: nn.Dropout):
+#         d_k = query.shape[-1]
+#         # Just apply the formula from the paper
+#         # (batch, h, seq_len, d_k) --> (batch, h, seq_len, seq_len)
+#         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
+#         if mask is not None:
+#             # Write a very low value (indicating -inf) to the positions where mask == 0
+#             # Use -1e4 for AMP (FP16) compatibility (-1e9 overflows FP16 which has max ~65504)
+#             attention_scores.masked_fill_(mask == 0, -1e4)
+#         attention_scores = attention_scores.softmax(dim=-1) # (batch, h, seq_len, seq_len) # Apply softmax
+#         if dropout is not None:
+#             attention_scores = dropout(attention_scores)
+#         # (batch, h, seq_len, seq_len) --> (batch, h, seq_len, d_k)
+#         # return attention scores which can be used for visualization
+#         return (attention_scores @ value), attention_scores
+
+#     def forward(self, q, k, v, mask, return_attn=False):
+#         query = self.w_q(q) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
+#         key = self.w_k(k) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
+#         value = self.w_v(v) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
+        
+#         # Apply layer normalization to Q and K to stabilize attention scores
+#         query = self.ln_q(query)
+#         key = self.ln_k(key)
+        
+#                 # ---- Safety clamp to prevent Q/K norm explosion (very important) ----
+#         query = query / (query.norm(dim=-1, keepdim=True) + 1e-6)
+#         key   = key   / (key.norm(dim=-1, keepdim=True) + 1e-6)
+
+#         # (batch, seq_len, d_model) --> (batch, seq_len, h, d_k) --> (batch, h, seq_len, d_k)
+#         query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
+#         key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
+#         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
+
+#         # Calculate attention
+#         x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+        
+#         # Combine all the heads together
+#         # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
+#         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
+
+#         # Multiply by Wo
+#         # (batch, seq_len, d_model) --> (batch, seq_len, d_model)  
+#         if return_attn:
+#             # Average attention across heads: (batch, h, tgt_len, src_len) -> (batch, tgt_len, src_len)
+#             avg_attn = self.attention_scores.mean(dim=1)
+#             return self.w_o(x), avg_attn
+#         return self.w_o(x)
+# --- Begin replacement: MultiHeadAttentionBlock ---
 class MultiHeadAttentionBlock(nn.Module):
+    """
+    Stable multi-head attention:
+      - uses LayerNorm on Q/K (no extra division by vector-norm)
+      - scaled dot-product with sqrt(head_dim)
+      - per-head learnable temperature (small scalar) to control sharpness
+      - logits clamped to avoid softmax numerical saturation
+      - stores attention_probs in `self.attention_scores` (detached) for diagnostics
+    """
 
-    def __init__(self, d_model: int, h: int, dropout: float) -> None:
+    def __init__(self, d_model: int, num_heads: int, dropout: float) -> None:
         super().__init__()
-        self.d_model = d_model # Embedding vector size
-        self.h = h # Number of heads
-        # Make sure d_model is divisible by h
-        assert d_model % h == 0, "d_model is not divisible by h"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.head_dim = d_model // num_heads
 
-        self.d_k = d_model // h # Dimension of vector seen by each head
-        self.w_q = nn.Linear(d_model, d_model, bias=False) # Wq
-        self.w_k = nn.Linear(d_model, d_model, bias=False) # Wk
-        self.w_v = nn.Linear(d_model, d_model, bias=False) # Wv
-        self.w_o = nn.Linear(d_model, d_model, bias=False) # Wo
-        
-        # Layer normalization for Q and K to prevent attention score collapse
-        self.ln_q = nn.LayerNorm(d_model)
-        self.ln_k = nn.LayerNorm(d_model)
-        
+        # Projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # LayerNorm applied to projected q/k (stabilizes logits)
+        self.q_norm = nn.LayerNorm(d_model)
+        self.k_norm = nn.LayerNorm(d_model)
+
         self.dropout = nn.Dropout(dropout)
-        
-        # Initialize attention projections with Xavier/Glorot for better convergence
-        nn.init.xavier_uniform_(self.w_q.weight)
-        nn.init.xavier_uniform_(self.w_k.weight)
-        nn.init.xavier_uniform_(self.w_v.weight)
-        nn.init.xavier_uniform_(self.w_o.weight)
 
-    @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout):
-        d_k = query.shape[-1]
-        # Just apply the formula from the paper
-        # (batch, h, seq_len, d_k) --> (batch, h, seq_len, seq_len)
-        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
+        # Per-head learnable temperature (initialized to 1.0)
+        # shape: (num_heads, 1, 1) so broadcasting over (B, H, Tq, Tk)
+        #self.head_temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.logit_temp = nn.Parameter(torch.zeros(self.num_heads, 1, 1))  # trainable
+        self.min_temp = 0.1
+        self.max_temp = 2.0
+
+        # Safety clamp range for logits before softmax (tunable)
+        self.logit_clamp_min = -20.0
+        self.logit_clamp_max = 20.0
+
+        # Init
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+
+        # placeholder for diagnostics
+        self.attention_scores = None
+
+    def forward(self, q, k, v, mask=None, return_attn=False):
+        """
+        q: (B, Tq, D)
+        k: (B, Tk, D)
+        v: (B, Tv, D)
+        mask: broadcastable mask (B, 1, Tq, Tk) or None
+        """
+        B, Tq, _ = q.size()
+        Tk = k.size(1)
+
+        # 1) Linear projections
+        q_proj = self.q_proj(q)    # (B, Tq, D)
+        k_proj = self.k_proj(k)    # (B, Tk, D)
+        v_proj = self.v_proj(v)    # (B, Tv, D)
+
+        # 2) Stabilize with LayerNorm on projected q/k (do NOT divide by full vector norm)
+        q_proj = self.q_norm(q_proj)
+        k_proj = self.k_norm(k_proj)
+
+        # 3) Reshape into heads -> (B, H, T, head_dim)
+        q_heads = q_proj.view(B, Tq, self.num_heads, self.head_dim).transpose(1, 2)
+        k_heads = k_proj.view(B, Tk, self.num_heads, self.head_dim).transpose(1, 2)
+        v_heads = v_proj.view(B, v_proj.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 4) Scaled dot-product
+        # attn_logits shape: (B, H, Tq, Tk)
+        attn_logits = torch.matmul(q_heads, k_heads.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # 5) Temperature scaling per head (learned small scalar)
+        #attn_logits = attn_logits * self.head_temperature
+        temp = torch.nn.functional.softplus(self.logit_temp)   # positive
+        temp = torch.clamp(temp, min=self.min_temp, max=self.max_temp)
+        attn_logits = attn_logits * temp
+
+        # 6) Safety clamp to keep logits in a numerically sane range
+        attn_logits = attn_logits.clamp(min=self.logit_clamp_min, max=self.logit_clamp_max)
+
+        # 7) Apply mask if provided (use large negative for masked positions)
         if mask is not None:
-            # Write a very low value (indicating -inf) to the positions where mask == 0
-            # Use -1e4 for AMP (FP16) compatibility (-1e9 overflows FP16 which has max ~65504)
-            attention_scores.masked_fill_(mask == 0, -1e4)
-        attention_scores = attention_scores.softmax(dim=-1) # (batch, h, seq_len, seq_len) # Apply softmax
-        if dropout is not None:
-            attention_scores = dropout(attention_scores)
-        # (batch, h, seq_len, seq_len) --> (batch, h, seq_len, d_k)
-        # return attention scores which can be used for visualization
-        return (attention_scores @ value), attention_scores
+            attn_logits = attn_logits.masked_fill(mask == 0, -1e4)
 
-    def forward(self, q, k, v, mask, return_attn=False):
-        query = self.w_q(q) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-        key = self.w_k(k) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-        value = self.w_v(v) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-        
-        # Apply layer normalization to Q and K to stabilize attention scores
-        query = self.ln_q(query)
-        key = self.ln_k(key)
-        
-                # ---- Safety clamp to prevent Q/K norm explosion (very important) ----
-        query = query / (query.norm(dim=-1, keepdim=True) + 1e-6)
-        key   = key   / (key.norm(dim=-1, keepdim=True) + 1e-6)
+        # 8) Softmax -> attention probabilities
+        attn_probs = torch.softmax(attn_logits, dim=-1)
+        attn_probs = self.dropout(attn_probs)
 
-        # (batch, seq_len, d_model) --> (batch, seq_len, h, d_k) --> (batch, h, seq_len, d_k)
-        query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
-        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
-        value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
+        # 9) Context
+        context_heads = torch.matmul(attn_probs, v_heads)  # (B, H, Tq, head_dim)
 
-        # Calculate attention
-        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
-        
-        # Combine all the heads together
-        # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
-        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
+        # 10) Merge heads -> (B, Tq, D)
+        context = context_heads.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
+        output = self.out_proj(context)
 
-        # Multiply by Wo
-        # (batch, seq_len, d_model) --> (batch, seq_len, d_model)  
+        # 11) Store detached attention probabilities for diagnostics (cheap & safe)
+        # detach to avoid extra autograd graph and reduce memory
+        self.attention_scores = attn_probs.detach() if attn_probs is not None else None
+
         if return_attn:
-            # Average attention across heads: (batch, h, tgt_len, src_len) -> (batch, tgt_len, src_len)
-            avg_attn = self.attention_scores.mean(dim=1)
-            return self.w_o(x), avg_attn
-        return self.w_o(x)
+            # avg over heads -> (B, Tq, Tk)
+            avg_attn = attn_probs.mean(dim=1) if attn_probs is not None else None
+            return output, avg_attn
+
+        return output
+# --- End replacement ---
 
 class EncoderBlock(nn.Module):
 

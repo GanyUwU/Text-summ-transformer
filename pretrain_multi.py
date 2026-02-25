@@ -271,6 +271,18 @@ def get_mixed_texts(config):
     print(f"  Ready for training!\n")
     return texts
 
+def head_diversity_loss(attn_probs):
+    # attn_probs: (batch, heads, tgt_len, src_len)
+    head_maps = attn_probs.mean(dim=(0, 2))  # (heads, src_len)
+    H = head_maps.size(0)
+    if H < 2:
+        return torch.tensor(0.0, device=attn_probs.device)
+
+    sims = []
+    for i in range(H):
+        for j in range(i+1, H):
+            sims.append(torch.cosine_similarity(head_maps[i], head_maps[j], dim=0))
+    return torch.stack(sims).mean()
 
 # ---- Mask helper (canonical masks) ----
 def make_masks_batch(encoder_input, decoder_input, pad_id, device):
@@ -362,8 +374,12 @@ def pretrain_multi():
     print(f"\n📊 Multi-Dataset Pretrain (decoder_lr_scale={decoder_lr_scale})")
     param_groups = get_layerwise_param_groups(model, base_lr=config['lr'], decoder_lr_scale=decoder_lr_scale)
     # NOTE: get_layerwise_param_groups should return groups with 'lr' set.
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=config['weight_decay'])
-
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        betas=(0.9, 0.98),
+        eps=1e-9,
+        weight_decay=config['weight_decay']
+    )
     if cockpit:
         optimizer = cockpit.attach(model, optimizer=optimizer, attn_store=attention_store)
 
@@ -477,6 +493,23 @@ def pretrain_multi():
                         
                 if ent_count > 0:
                     loss = loss + (entropy_reg_weight * (ent_accum / max(1, ent_count)))
+                    # ── Head Diversity Regularization (prevents heads collapsing to same pattern) ──
+            div_weight = config.get("diversity_weight", 0.0)
+            if div_weight > 0:
+                div_accum = 0.0
+                div_count = 0
+
+                # Encoder self-attention diversity
+                for layer in model.encoder.layers:
+                    attn = getattr(layer.self_attention_block, "attention_scores", None)
+                    if attn is not None:
+                        div_accum += head_diversity_loss(attn)
+                        div_count += 1
+
+                if div_count > 0:
+                    div_loss = div_accum / div_count
+                    loss = loss + div_weight * div_loss
+                    writer.add_scalar("debug/diversity_loss", float(div_loss.item()), global_step)
 
             loss = loss / accumulation_steps
 

@@ -185,24 +185,27 @@ def get_multi_dataset_config():
     config.update({
         # Training — STABLE from-scratch pretraining
         "lr": 1e-4,                 # ↓ from 1e-3 (main fix)
-        "warmup_steps": 2000,      # ↑ from 500
-        "num_steps": 50000,
+        "warmup_steps": 1000,      # ↑ from 500
+        "num_steps": 400000,        # 400k micro ÷ 16 accum = 25k optimizer steps
         "dropout": 0.2,
-        "weight_decay": 0.01,      # ↓ from 0.05
+        "weight_decay": 0.01,      # ↓ from 0.
+        "grad_clip": 0.5,
 
         # Datasets — keep as-is
         "datasets": ["wikipedia", "bookcorpus", "openwebtext"],
         "max_articles": 1500000,
 
         # Diagnostics — monitor, don’t fight numerics
-        "entropy_reg_weight": 1e-4,    # ↓ from 1e-3 (or set to 0.0 initially)
-        "target_entropy": 1.5,         # ↓ from 2.5 (more realistic for deep layers)
+        "entropy_reg_weight": 1e-3,#5e-3,    # ↓ from 1e-3 (or set to 0.0 initially)
+        "target_entropy": 2.0,         # ↓ from 2.5 (more realistic for deep layers)
         "decoder_lr_scale": 1.0,
         "reinit_decoder_heads": False,   # don’t reinit during a run
         "reinit_only_decoder": True,     # if you ever reinit, decoder only
+        "diversity_weight": 0.0,#1e-2,
+        "label_smoothing": 0.1,         # fights output overconfidence
 
         # Safety — don’t resume broken runs
-        "resume_from": "pretrain_weights_multi_fixed/pretrain_multi_fixed_step_6000.pt",
+        "resume_from": "pretrain_weights_multi_fixed/pretrain_multi_fixed_best.pt",
 
         #"debug_samples": 20000,
 
@@ -213,7 +216,7 @@ def get_multi_dataset_config():
         # Checkpointing
         "model_folder": "pretrain_weights_multi_fixed",
         "model_basename": "pretrain_multi_fixed_",
-        "experiment_name": "runs/pretrain_multi_stable",
+        "experiment_name": "runs/pretrain_multi_stable_fin",
     })
     return config
 
@@ -252,10 +255,10 @@ def get_pretrain_config():
 
         # Training
         "batch_size": 4,
-        "gradient_accumulation": 8,
+        "gradient_accumulation": 16,
         "num_steps": 25000,
         "lr": 3e-4,                # SAFER base LR for from-scratch
-        "warmup_steps": 2000,     # Longer warmup to avoid early collapse
+        "warmup_steps": 1000,     # Longer warmup to avoid early collapse
         "weight_decay": 0.01,
         "grad_clip": 1.0,
         "label_smoothing": 0.0,
