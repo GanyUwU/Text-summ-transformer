@@ -193,15 +193,16 @@ def beam_search_decode(model, encoder_output, encoder_mask, tokenizer, max_len,
     return best[1]
 
 
-def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokenizer, max_len, device):
+def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokenizer, max_len, device, 
+                 no_repeat_ngram=3, repetition_penalty=1.2, min_len=10):
     """
-    Greedy decoding with support for Copy Mechanism.
+    Greedy decoding with support for Copy Mechanism and N-Gram blocking.
     """
     bos_id = tokenizer.bos_id
     eos_id = tokenizer.eos_id
-    pad_id = tokenizer.pad_id
     
     decoder_input = torch.tensor([[bos_id]], dtype=torch.long).to(device)
+    generated_tokens = []
     
     use_copy = model.copy_mechanism is not None
     
@@ -212,45 +213,142 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
         
         with torch.no_grad():
             if use_copy:
-                # Get blended distribution
                 decoder_output, cross_attn = model.decode(
                     encoder_output, encoder_mask, decoder_input, decoder_mask,
                     return_cross_attn=True
                 )
                 vocab_logits = model.project(decoder_output)
-                
-                # Get decoder embeddings for p_gen
-                tgt_embed = model.tgt_embed(decoder_input)
-                tgt_embed = model.tgt_pos(tgt_embed)
-                
-                # Context vector
+                tgt_embed = model.tgt_pos(model.tgt_embed(decoder_input))
                 context_vector = torch.bmm(cross_attn, encoder_output)
                 
-                # Blended distribution
                 final_dist, p_gen = model.copy_mechanism(
                     decoder_output, context_vector, tgt_embed,
                     vocab_logits, cross_attn, encoder_input_ids
                 )
-                
-                # Argmax on blended distribution
-                next_token = torch.argmax(final_dist[:, -1, :], dim=-1).item()
+                probs = final_dist[:, -1, :]
             else:
-                # Standard decoding
                 decoder_output = model.decode(
                     encoder_output, encoder_mask, decoder_input, decoder_mask
                 )
                 logits = model.project(decoder_output[:, -1, :])
-                next_token = torch.argmax(logits, dim=-1).item()
+                probs = torch.softmax(logits, dim=-1)
         
-        decoder_input = torch.cat([
-            decoder_input,
-            torch.tensor([[next_token]], dtype=torch.long).to(device)
-        ], dim=1)
+        # Repetition Penalty
+        if repetition_penalty != 1.0:
+            for token in set(generated_tokens):
+                probs[:, token] /= repetition_penalty
+            probs /= probs.sum(dim=-1, keepdim=True)
+
+        # N-Gram blocking
+        if no_repeat_ngram > 0 and len(generated_tokens) >= no_repeat_ngram - 1:
+            current_gram = tuple(generated_tokens[-(no_repeat_ngram-1):])
+            for i in range(len(generated_tokens) - no_repeat_ngram + 1):
+                if tuple(generated_tokens[i:i+no_repeat_ngram-1]) == current_gram:
+                    probs[:, generated_tokens[i+no_repeat_ngram-1]] = 0.0
+            probs /= (probs.sum(dim=-1, keepdim=True) + 1e-12)
+
+        # Force Min Length
+        if len(generated_tokens) < min_len:
+            probs[:, eos_id] = 0.0
+            probs /= (probs.sum(dim=-1, keepdim=True) + 1e-12)
+
+        next_token = torch.argmax(probs, dim=-1).item()
         
         if next_token == eos_id:
             break
             
-    return decoder_input[0].tolist()
+        generated_tokens.append(next_token)
+        decoder_input = torch.cat([
+            decoder_input,
+            torch.tensor([[next_token]], dtype=torch.long).to(device)
+        ], dim=1)
+            
+    return [bos_id] + generated_tokens
+
+
+def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokenizer, max_len, device, 
+                       beam_size=4, no_repeat_ngram=3, length_penalty=0.6, min_len=10):
+    """
+    Beam Search decoding with support for Copy Mechanism and N-Gram blocking.
+    """
+    bos_id = tokenizer.bos_id
+    eos_id = tokenizer.eos_id
+    
+    # Beam: list of (token_ids, score, finished)
+    beams = [([bos_id], 0.0, False)]
+    
+    use_copy = model.copy_mechanism is not None
+    
+    for _ in range(max_len):
+        new_candidates = []
+        all_finished = True
+        
+        for tokens, score, finished in beams:
+            if finished or tokens[-1] == eos_id:
+                new_candidates.append((tokens, score, True))
+                continue
+            
+            all_finished = False
+            decoder_input = torch.tensor([tokens], dtype=torch.long).to(device)
+            decoder_mask = torch.tril(
+                torch.ones((1, 1, decoder_input.size(1), decoder_input.size(1)), dtype=torch.bool)
+            ).to(device)
+            
+            with torch.no_grad():
+                if use_copy:
+                    decoder_output, cross_attn = model.decode(
+                        encoder_output, encoder_mask, decoder_input, decoder_mask,
+                        return_cross_attn=True
+                    )
+                    vocab_logits = model.project(decoder_output)
+                    tgt_embed = model.tgt_pos(model.tgt_embed(decoder_input))
+                    context_vector = torch.bmm(cross_attn, encoder_output)
+                    final_dist, _ = model.copy_mechanism(
+                        decoder_output, context_vector, tgt_embed,
+                        vocab_logits, cross_attn, encoder_input_ids
+                    )
+                    probs = final_dist[0, -1, :]
+                else:
+                    decoder_output = model.decode(
+                        encoder_output, encoder_mask, decoder_input, decoder_mask
+                    )
+                    logits = model.project(decoder_output[0, -1, :])
+                    probs = torch.softmax(logits, dim=-1)
+            
+            # N-Gram blocking
+            if no_repeat_ngram > 0 and len(tokens) >= no_repeat_ngram:
+                current_gram = tuple(tokens[-(no_repeat_ngram-1):])
+                for i in range(len(tokens) - no_repeat_ngram + 1):
+                    if tuple(tokens[i:i+no_repeat_ngram-1]) == current_gram:
+                        probs[tokens[i+no_repeat_ngram-1]] = 1e-12
+            
+            # Force Min Length
+            if len(tokens) < min_len:
+                probs[eos_id] = 1e-12
+                
+            log_probs = torch.log(probs + 1e-12)
+            
+            # Get top-k transitions
+            topk_log_probs, topk_ids = torch.topk(log_probs, beam_size)
+            
+            for i in range(beam_size):
+                next_id = topk_ids[i].item()
+                next_score = score + topk_log_probs[i].item()
+                new_candidates.append((tokens + [next_id], next_score, next_id == eos_id))
+        
+        if all_finished:
+            break
+            
+        # Score normalization (Length Penalty)
+        def get_score(cand):
+            tokens, score, _ = cand
+            return score / (len(tokens) ** length_penalty)
+            
+        new_candidates.sort(key=get_score, reverse=True)
+        beams = new_candidates[:beam_size]
+        
+    # Return best beam
+    return beams[0][0]
 
 
 def compute_rouge(predictions, references):
@@ -294,12 +392,21 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5)
             # Encode
             enc_out = model.encode(encoder_input, encoder_mask)
             
-            # Decode - ALWAYS use greedy decode with copy support for now
-            # (Beam search with copy mechanism is complex and currently unimplemented)
-            out_ids = greedy_decode(
-                model, enc_out, encoder_mask, encoder_input,
-                tokenizer, config['tgt_seq_len'], device
-            )
+            # Decode - Use Beam Search if beam_size > 1
+            if config.get('beam_size', 1) > 1:
+                out_ids = beam_search_decode(
+                    model, enc_out, encoder_mask, encoder_input,
+                    tokenizer, config['tgt_seq_len'], device,
+                    beam_size=config['beam_size'],
+                    no_repeat_ngram=3, # Strictly enforce for anti-hallucination
+                    length_penalty=0.8  # PH8: Punchier summaries (was 0.6 or 1.0)
+                )
+            else:
+                out_ids = greedy_decode(
+                    model, enc_out, encoder_mask, encoder_input,
+                    tokenizer, config['tgt_seq_len'], device,
+                    no_repeat_ngram=config.get('no_repeat_ngram', 3)
+                )
             
             # Decode to text
             decoded = tokenizer.decode(out_ids)
@@ -314,8 +421,8 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5)
             
             if i < num_examples:
                 print(f"\nExample {i+1}:")
-                print(f"  REF: {ref_text[:100]}...")
-                print(f"  GEN: {decoded[:100]}...")
+                print(f"  REF: {ref_text}")
+                print(f"  GEN: {decoded}")
     
     # Compute ROUGE
     rouge_scores = compute_rouge(predictions, references)
@@ -452,10 +559,15 @@ def finetune():
     total_steps = len(train_loader) * config['num_epochs'] // config['gradient_accumulation']
     warmup_steps = config['warmup_steps']
     
+    import math
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
-        return max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
+        
+        # Cosine Annealing (from peak to 10% of peak)
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(0.1, cosine_decay) # Decay to 10% of base LR
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
@@ -500,6 +612,9 @@ def finetune():
     global_step = 0
     accumulation_steps = config['gradient_accumulation']
     
+    # Initialize rouge_scores to prevent UnboundLocalError at epoch end
+    rouge_scores = {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
+    
     for epoch in range(config['num_epochs']):
         model.train()
         epoch_loss = 0
@@ -538,29 +653,39 @@ def finetune():
                     logits = model.project(dec_out)
                     loss = loss_fn(logits.view(-1, vocab_size), label.view(-1))
                 
-                # ── Auxiliary losses ──
-                # Coverage loss (from cross-attention in last decoder layer)
-                if use_copy and coverage_loss_weight > 0:
-                    last_layer = model.decoder.layers[-1]
-                    cross_attn = last_layer.cross_attention_block.attention_scores
-                    if cross_attn is not None:
-                        # cross_attn: (B, H, T_out, T_in) → avg over heads
-                        avg_cross = cross_attn.mean(dim=1)  # (B, T_out, T_in)
-                        cov_loss = compute_coverage_loss(avg_cross)
-                        loss = loss + coverage_loss_weight * cov_loss
+                # ── Phase 8: Weighted Hybrid Loss (Refined) ──
+                # 1. Base Loss (Factual Accuracy via smooth_nll_loss) is already calculated above as 'loss'
+                base_loss = loss
                 
-                # Entropy regularization (prevent decoder self-attention collapse)
+                # 2. Attention Sharpening (Target 1.6 - "The Drill Sergeant")
+                ent_reg_loss = 0.0
                 if entropy_reg_weight > 0:
-                    decoder_layer2 = model.decoder.layers[2]
-                    self_attn = decoder_layer2.self_attention_block.attention_scores
-                    if self_attn is not None:
-                        ent_loss = entropy_regularization(self_attn, target_entropy=2.0)
-                        loss = loss + entropy_reg_weight * ent_loss
+                    target_ent = config.get('target_entropy', 1.6)
+                    # Use last layer cross-attention maps for target sharpening
+                    cross_layer = model.decoder.layers[-1]
+                    ca_attn = cross_layer.cross_attention_block.attention_scores
+                    if ca_attn is not None:
+                        ent_reg_loss = entropy_regularization(ca_attn, target_entropy=target_ent)
                 
-                # p_gen balance (prevent copy mechanism domination)
+                # 3. Pointer Control (Target 0.45 - "The Gossip Filter")
+                pgen_loss = 0.0
                 if use_copy and p_gen is not None:
-                    pgen_aux = 0.01 * pgen_balance_loss(p_gen)
-                    loss = loss + pgen_aux
+                    pgen_loss = pgen_balance_loss(p_gen, target=0.45)
+                
+                # 4. Coverage Loss (prevents repetition)
+                cov_loss = 0.0
+                if use_copy and coverage_loss_weight > 0:
+                    cov_total = 0.0
+                    for layer_idx in [-1, -2]: # Multi-layer grounding
+                        target_layer = model.decoder.layers[layer_idx]
+                        at = target_layer.cross_attention_block.attention_scores
+                        if at is not None:
+                            cov_total += compute_coverage_loss(at.mean(dim=1))
+                    cov_loss = (cov_total / 2.0)
+                
+                # 5. Combined Final Loss
+                # We use 0.05 weights as per user request to guide without overwhelming
+                loss = base_loss + (0.05 * ent_reg_loss) + (0.05 * pgen_loss) + (coverage_loss_weight * cov_loss)
                 
                 loss = loss / accumulation_steps
             
@@ -590,17 +715,31 @@ def finetune():
                 global_step += 1
                 
                 writer.add_scalar('finetune/loss', loss.item() * accumulation_steps, global_step)
+                writer.add_scalar('finetune/lr', scheduler.get_last_lr()[0], global_step)
                 
-                # ── Periodic diagnostics ──
+                # Log global gradient health at every update
+                check_gradient_health(model, writer, global_step)
+                
+                # ── Periodic diagnostics & Health ──
                 if global_step % diagnostic_every == 0:
-                    # Log attention entropy for decoder layers
-                    for li, layer in enumerate(model.decoder.layers):
-                        sa_attn = layer.self_attention_block.attention_scores
-                        if sa_attn is not None:
-                            log_attention_entropy(writer, sa_attn, f"dec_self_L{li}", global_step)
-                        ca_attn = layer.cross_attention_block.attention_scores
-                        if ca_attn is not None:
-                            log_attention_entropy(writer, ca_attn, f"dec_cross_L{li}", global_step)
+                    # Log the "Health" of primary cross-attention (Sharpness)
+                    last_layer_attn = model.decoder.layers[-1].cross_attention_block.attention_scores
+                    if last_layer_attn is not None:
+                        # Mean entropy across top heads
+                        head_ent = -(last_layer_attn * (last_layer_attn + 1e-12).log()).sum(-1).mean(dim=[0, 2])
+                        avg_ent = head_ent.mean().item()
+                        writer.add_scalar("Diagnostics/Attention_Entropy", avg_ent, global_step)
+                    
+                    # Log how much the model is "cheating" by copying
+                    if p_gen is not None:
+                        avg_pgen = p_gen.mean().item()
+                        writer.add_scalar("Diagnostics/P_Gen_Mean", avg_pgen, global_step)
+
+                # ── Head-Shock (Anti-Collapse) ──
+                if global_step % 1000 == 0:
+                    # Every 1000 steps, detect and reinitialize collapsed decoder heads
+                    reinit_collapsed_heads(model, only_decoder=True)
+                    tqdm.write("  ⚡ Head-Shock: Re-initialized stagnant attention patterns.")
                     
                     # Log p_gen if using copy
                     if use_copy and p_gen is not None:
@@ -656,26 +795,44 @@ def finetune():
         avg_loss = epoch_loss / len(train_loader)
         print(f"\nEpoch {epoch+1} - Average Loss: {avg_loss:.4f}")
         
-        # Early stopping
-        current_rouge = rouge_scores['rouge1']
-        if current_rouge > best_rouge:
-            best_rouge = current_rouge
-            patience_counter = 0
-            best_path = Path(config['model_folder']) / f"{config['model_basename']}best.pt"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'loss': avg_loss,
-                'rouge1': current_rouge,
-            }, best_path)
-            print(f"✓ New best model! ROUGE-1: {best_rouge:.4f}")
-        else:
-            patience_counter += 1
-            print(f"  No improvement. Patience: {patience_counter}/{config['patience']}")
+        # Force validation at end of epoch if we haven't done it recently
+        if global_step % config['save_every'] != 0:
+            print("\nRunning End-of-Epoch Validation...")
+            rouge_scores = run_validation(
+                model, val_loader, tokenizer, config, device,
+                num_examples=config['num_validation_examples']
+            )
             
-            if patience_counter >= config['patience']:
-                print("\n⚠ Early stopping triggered!")
-                break
+            writer.add_scalar('finetune/rouge1', rouge_scores['rouge1'], global_step)
+            writer.add_scalar('finetune/rouge2', rouge_scores['rouge2'], global_step)
+            writer.add_scalar('finetune/rougeL', rouge_scores['rougeL'], global_step)
+            
+            current_rouge = rouge_scores['rouge1']
+            if current_rouge > best_rouge:
+                best_rouge = current_rouge
+                patience_counter = 0
+                best_path = Path(config['model_folder']) / f"{config['model_basename']}best.pt"
+                torch.save({
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'best_rouge1': best_rouge,
+                }, best_path)
+                print(f"  ⭐ New best ROUGE-1: {best_rouge:.4f} (Saved to {best_path})")
+            else:
+                patience_counter += 1
+
+        # End of epoch summary
+        current_rouge = rouge_scores['rouge1']
+        tqdm.write(f"\nEpoch {epoch+1} Complete - Current ROUGE-1: {current_rouge:.4f} (Best: {best_rouge:.4f})")
+        
+        # Early stopping check
+        if patience_counter >= config['patience']:
+            print("\n⚠ Early stopping triggered!")
+            break
+        
+        # Clear any accumulated patience if we had a breakthrough this epoch
+        if current_rouge > best_rouge:
+            patience_counter = 0
     
     print("\n" + "="*70)
     print("FINE-TUNING COMPLETE!")

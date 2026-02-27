@@ -102,14 +102,18 @@ def get_finetune_config():
         "tgt_seq_len": 128,
         
         # Training (from-scratch: higher LR + more epochs)
+        # Training
         "batch_size": 4,
-        "gradient_accumulation": 8,  # Effective batch = 4 * 8 = 32
-        "num_epochs": 10,
-        "lr": 3e-5,                  # Lower LR for fine-tuning from pretrained
-        "warmup_steps": 1000,        # More warmup for stability
+        "gradient_accumulation": 16, # INCREASED (was 8) for effective batch = 64
+        # Training
+        "batch_size": 4,
+        "gradient_accumulation": 16, # INCREASED (was 8) for effective batch = 64
+        "num_epochs": 4,             # Phase 8: Short "kick" phase
+        "lr": 4e-5,                  # Phase 8: Warm restart (was 5e-5)
+        "warmup_steps": 500,         # Shorter warmup for warm restart
         "weight_decay": 0.01,
         "grad_clip": 1.0,
-        "label_smoothing": 0.1,
+        "label_smoothing": 0.1,      # REVERTED to 0.1 for stability
         
         # Mixed precision
         "use_amp": True,
@@ -117,28 +121,34 @@ def get_finetune_config():
         # Data
         "datasource": "cnn_dailymail",
         "dataset_version": "3.0.0",
-        "train_samples": 50000,
-        "val_samples": 2000,
+        "train_samples": 100000,     # INCREASED (was 50k) for better generalization
+        "val_samples": 5000,         # BUMPED (was 2k) for more robust ROUGE metrics
         
-        # Load Phase 2 recovered weights
-        "pretrain_weights": "pretrain_weights_multi_fixed/pretrain_multi_fixed_step_15000.pt",
+        # Phase 8: Warm restart from the absolute best weights found so far
+        "pretrain_weights": "weights_v5/summarizer_best.pt",
         "preload": None,
         
         # Evaluation & Diagnostics
-        "save_every": 1000,          # Validate every 1000 steps
-        "diagnostic_every": 100,
-        "patience": 10,              # Give it more time to start learning
+        "save_every": 1000,          # More frequent validation for Phase 8
+        "diagnostic_every": 300,
+        "patience": 10,              # Give it room to find the new sharp peak
         "eval_metric": "rouge1",
         
-        # Checkpointing (new folder for final fine-tuning)
-        "model_folder": "weights_v5",
+        # Phase 8: Generalist Realignment (Anti-Hallucination)
+        "coverage_loss_weight": 1.0,   # Normalized in diagnostics.py
+        "entropy_reg_weight": 2e-3,    # Maintain pressure
+        "target_entropy": 1.6,         # PHASE 8: SHARPEN (was 2.5)
+        
+        # Checkpointing (Moving to v6 for the generalist breakthrough)
+        "model_folder": "weights_v6",
         "model_basename": "summarizer_",
-        "experiment_name": "runs/train_v5_final_finetune",
+        "experiment_name": "runs/train_v8_generalist_focus",
         
         "beam_size": 4,
         "length_penalty": 1.0,
         "no_repeat_ngram": 3,
         "num_validation_examples": 5,
+        "reinit_decoder_heads": False,  # Preserve specialized heads from Step 25k
     }   
 #         # Diagnostics (from reviewer's checklist)
 #         "entropy_reg_weight": 1e-3,       # Attention entropy regularization
@@ -185,7 +195,7 @@ def get_multi_dataset_config():
     config.update({
         # Training — STABLE from-scratch pretraining
         "lr": 1e-4,                 # ↓ from 1e-3 (main fix)
-        "warmup_steps": 1000,      # ↑ from 500
+        "warmup_steps": 2000,      # ↑ from 1000 (more stable start)
         "num_steps": 400000,        # 400k micro ÷ 16 accum = 25k optimizer steps
         "dropout": 0.2,
         "weight_decay": 0.01,      # ↓ from 0.
@@ -205,7 +215,7 @@ def get_multi_dataset_config():
         "label_smoothing": 0.1,         # fights output overconfidence
 
         # Safety — don’t resume broken runs
-        "resume_from": "pretrain_weights_multi_fixed/pretrain_multi_fixed_best.pt",
+        "resume_from": "pretrain_weights_multi_fixed/pretrain_multi_fixed_step_18500.pt",
 
         #"debug_samples": 20000,
 
@@ -216,7 +226,7 @@ def get_multi_dataset_config():
         # Checkpointing
         "model_folder": "pretrain_weights_multi_fixed",
         "model_basename": "pretrain_multi_fixed_",
-        "experiment_name": "runs/pretrain_multi_stable_fin",
+        "experiment_name": "runs/pretrain_multi_stable_final",
     })
     return config
 

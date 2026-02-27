@@ -387,11 +387,21 @@ def pretrain_multi():
     warmup_steps = config.get("warmup_steps", 2000)
     base_lr = config.get('lr', 1e-4)
 
+    import math
     def lr_lambda(step):
-        # linear warmup from 0 -> 1 across warmup_steps
+        # step here is the absolute global_step (optimizer steps)
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
-        return 1.0
+        
+        # Cosine decay from 1.0 -> 0.1 over the remaining optimizer steps
+        # total_steps for scheduler is config['num_steps'] / accumulation_steps
+        total_opt_steps = config['num_steps'] // accumulation_steps
+        if step >= total_opt_steps:
+            return 0.1
+        
+        progress = (step - warmup_steps) / max(1, total_opt_steps - warmup_steps)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(0.1, cosine_decay)
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
@@ -424,10 +434,10 @@ def pretrain_multi():
 
         if 'scheduler_state_dict' in ckpt:
             try:
-                # scheduler may require exact optimizer state; try best-effort
-                print("  ✓ Scheduler state present (skipping strict restore if incompatible)")
-            except Exception:
-                pass
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                print("  ✓ Scheduler state resumed")
+            except Exception as e:
+                print(f"  ! Could not resume scheduler state: {e}. It will recalibrate from global_step.")
 
         global_step = ckpt.get('step', global_step)
         best_loss = ckpt.get('best_loss', best_loss)
@@ -442,9 +452,27 @@ def pretrain_multi():
     progress = tqdm(range(config['num_steps']), desc="Multi-Pretrain")
 
     dataset_iter = iter(dataloader)
+    
+    # ── Fast-forward dataset to match global_step ──
+    # We skip (global_step * accumulation_steps) micro-steps
+    skip_micro_steps = global_step * accumulation_steps
+    if skip_micro_steps > 0:
+        print(f"[RESUME] Fast-forwarding dataset {skip_micro_steps} micro-steps...")
+        for _ in range(skip_micro_steps):
+            try:
+                next(dataset_iter)
+            except StopIteration:
+                dataset_iter = iter(dataloader)
+                next(dataset_iter)
+        print(f"  ✓ Fast-forward complete.")
+
     first_masks_printed = False
 
     for step in progress:
+        # If we resumed, skip already completed micro-steps in the progress bar range
+        if step < skip_micro_steps:
+            continue
+            
         try:
             batch = next(dataset_iter)
         except StopIteration:
