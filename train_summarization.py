@@ -24,15 +24,18 @@ from tqdm import tqdm
 from pathlib import Path
 import heapq
 
-from datasets import load_dataset
+from datasets import load_dataset, exceptions as ds_exceptions
+import random
 from model import build_transformer
 from pretrain_config import get_finetune_config
 from tokenizer_utils import get_tokenizer
+from checkpoint_utils import load_checkpoint
 from diagnostics import (
     get_layerwise_param_groups, reinit_collapsed_heads,
     compute_coverage_loss, entropy_regularization,
     log_attention_entropy, log_pgen, check_gradient_health,
-    print_diagnostic_summary, smooth_nll_loss, pgen_balance_loss
+    print_diagnostic_summary, smooth_nll_loss, pgen_balance_loss,
+    aggressive_pgen_penalty  # NUCLEAR FIX: aggressive linear penalty for copying
 )
 
 try:
@@ -46,11 +49,12 @@ except ImportError:
 class SummarizationDataset(Dataset):
     """Dataset for CNN/DailyMail summarization using SentencePiece tokenizer."""
     
-    def __init__(self, data, tokenizer, src_seq_len, tgt_seq_len):
+    def __init__(self, data, tokenizer, src_seq_len, tgt_seq_len, lead_mask_prob=0.0):
         self.data = data
         self.tokenizer = tokenizer
         self.src_seq_len = src_seq_len
         self.tgt_seq_len = tgt_seq_len
+        self.lead_mask_prob = lead_mask_prob
         
         self.pad_id = tokenizer.pad_id
         self.bos_id = tokenizer.bos_id
@@ -61,9 +65,20 @@ class SummarizationDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        article = item['article']
-        summary = item['highlights']
+        # Support fallback keys for multi-dataset (CNN/DM, XSum, SAMSum)
+        article = item.get('article', item.get('document', item.get('dialogue', '')))
+        summary = item.get('highlights', item.get('summary', ''))
         
+        if self.lead_mask_prob > 0 and random.random() < self.lead_mask_prob:
+            # Mask the lead: find first 1-2 sentence endings
+            sentences = article.split('. ')
+            if len(sentences) > 2:
+                # Drop first 1-2 sentences randomly
+                num_to_drop = random.randint(1, 2)
+                article = '. '.join(sentences[num_to_drop:]).strip()
+            elif len(sentences) > 1:
+                article = sentences[1].strip()
+
         # Tokenize
         src_tokens = self.tokenizer.encode(article)[:self.src_seq_len - 2]
         tgt_tokens = self.tokenizer.encode(summary)[:self.tgt_seq_len - 2]
@@ -88,9 +103,13 @@ class SummarizationDataset(Dataset):
         decoder_input = torch.tensor(dec_input, dtype=torch.long)
         label = torch.tensor(label, dtype=torch.long)
         
-        # Masks
-        encoder_mask = (encoder_input != self.pad_id).unsqueeze(0).unsqueeze(0)
-        decoder_mask = (decoder_input != self.pad_id).unsqueeze(0) & self._causal_mask(self.tgt_seq_len)
+        # Masks — return 3D shapes. DataLoader stacking will make them 4D: (B, 1, Tq, Tk)
+        # Encoder mask: (1, 1, src_len) -> batches to (B, 1, 1, src_len)
+        encoder_mask = (encoder_input != self.pad_id).view(1, 1, -1)
+        # Decoder mask: (1, tgt_len, tgt_len) -> batches to (B, 1, tgt_len, tgt_len)
+        padding_mask = (decoder_input != self.pad_id).view(1, 1, -1)  # (1,1,T)
+        causal_mask = self._causal_mask(self.tgt_seq_len)             # (1,T,T)
+        decoder_mask = padding_mask & causal_mask  # broadcasts to (1,T,T)
         
         return {
             'encoder_input': encoder_input,
@@ -105,92 +124,6 @@ class SummarizationDataset(Dataset):
     def _causal_mask(self, size):
         return torch.tril(torch.ones((1, size, size), dtype=torch.bool))
 
-
-def beam_search_decode(model, encoder_output, encoder_mask, tokenizer, max_len, 
-                      beam_size=4, length_penalty=1.0, device='cuda'):
-    """
-    Beam search decoding for better output quality.
-    
-    Args:
-        model: Transformer model
-        encoder_output: Encoded source
-        encoder_mask: Source mask
-        tokenizer: Tokenizer
-        max_len: Maximum output length
-        beam_size: Number of beams
-        length_penalty: Length normalization factor
-        device: Device
-    
-    Returns:
-        Best decoded sequence
-    """
-    bos_id = tokenizer.bos_id
-    eos_id = tokenizer.eos_id
-    
-    # Initialize beams: (score, sequence)
-    beams = [(0.0, [bos_id])]
-    completed = []
-    
-    for step in range(max_len):
-        all_candidates = []
-        
-        for score, seq in beams:
-            if seq[-1] == eos_id:
-                # Normalize score by length
-                length_norm = ((5 + len(seq)) / 6) ** length_penalty
-                completed.append((score / length_norm, seq))
-                continue
-            
-            # Build decoder input
-            decoder_input = torch.tensor([seq], dtype=torch.long).to(device)
-            decoder_mask = torch.tril(
-                torch.ones((1, 1, len(seq), len(seq)), dtype=torch.bool)
-            ).to(device)
-            
-            # Forward pass
-            with torch.no_grad():
-                decoder_output = model.decode(
-                    encoder_output, encoder_mask, decoder_input, decoder_mask
-                )
-                logits = model.project(decoder_output[:, -1, :])
-                log_probs = F.log_softmax(logits, dim=-1)
-            
-            # Get top-k tokens
-            top_log_probs, top_tokens = torch.topk(log_probs[0], beam_size)
-            
-            for i in range(beam_size):
-                token = top_tokens[i].item()
-                new_score = score + top_log_probs[i].item()
-                new_seq = seq + [token]
-                all_candidates.append((new_score, new_seq))
-        
-        # Select top beams
-        if not all_candidates:
-            break
-        
-        # Sort by score (descending)
-        all_candidates.sort(key=lambda x: x[0], reverse=True)
-        beams = all_candidates[:beam_size]
-        
-        # Early stop if all beams completed
-        if all(seq[-1] == eos_id for _, seq in beams):
-            for score, seq in beams:
-                length_norm = ((5 + len(seq)) / 6) ** length_penalty
-                completed.append((score / length_norm, seq))
-            break
-    
-    # Add any remaining beams to completed
-    for score, seq in beams:
-        if seq[-1] != eos_id:
-            length_norm = ((5 + len(seq)) / 6) ** length_penalty
-            completed.append((score / length_norm, seq))
-    
-    if not completed:
-        return [bos_id]
-    
-    # Return best sequence
-    best = max(completed, key=lambda x: x[0])
-    return best[1]
 
 
 def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokenizer, max_len, device, 
@@ -237,7 +170,8 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
         if repetition_penalty != 1.0:
             for token in set(generated_tokens):
                 probs[:, token] /= repetition_penalty
-            probs /= probs.sum(dim=-1, keepdim=True)
+            # Safety re-normalization
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-12)
 
         # N-Gram blocking
         if no_repeat_ngram > 0 and len(generated_tokens) >= no_repeat_ngram - 1:
@@ -287,6 +221,9 @@ def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, t
             if finished or tokens[-1] == eos_id:
                 new_candidates.append((tokens, score, True))
                 continue
+            
+            # Repetition penalty for candidate generation
+            # (Note: simpler to apply it inside the score calculation or to probs)
             
             all_finished = False
             decoder_input = torch.tensor([tokens], dtype=torch.long).to(device)
@@ -369,7 +306,7 @@ def compute_rouge(predictions, references):
     return {k: np.mean(v) for k, v in scores.items()}
 
 
-def run_validation(model, val_loader, tokenizer, config, device, num_examples=5):
+def run_validation(model, val_loader, tokenizer, config, device, num_examples=5, num_print=5):
     """Run validation with beam search and ROUGE."""
     model.eval()
     
@@ -379,7 +316,9 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5)
     print("\n" + "-"*60)
     print("VALIDATION")
     print("-"*60)
-    #some with loop
+    
+    # Randomly select indices to print
+    print_indices = random.sample(range(min(len(val_loader), num_examples)), min(num_print, num_examples))
     
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
@@ -398,8 +337,8 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5)
                     model, enc_out, encoder_mask, encoder_input,
                     tokenizer, config['tgt_seq_len'], device,
                     beam_size=config['beam_size'],
-                    no_repeat_ngram=3, # Strictly enforce for anti-hallucination
-                    length_penalty=0.8  # PH8: Punchier summaries (was 0.6 or 1.0)
+                    no_repeat_ngram=3, 
+                    length_penalty=config.get('length_penalty', 0.8)
                 )
             else:
                 out_ids = greedy_decode(
@@ -419,7 +358,7 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5)
             ref_text = tokenizer.decode(lbl_ids)
             references.append(ref_text)
             
-            if i < num_examples:
+            if i in print_indices:
                 print(f"\nExample {i+1}:")
                 print(f"  REF: {ref_text}")
                 print(f"  GEN: {decoded}")
@@ -427,13 +366,32 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5)
     # Compute ROUGE
     rouge_scores = compute_rouge(predictions, references)
     
-    print(f"\nROUGE Scores:")
+    print(f"\nROUGE Scores (n={len(predictions)}):")
     print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}")
     print(f"  ROUGE-2: {rouge_scores['rouge2']:.4f}")
     print(f"  ROUGE-L: {rouge_scores['rougeL']:.4f}")
-    print("-"*60)
+    print("-" * 60)
     
     return rouge_scores
+
+
+def save_checkpoint(model, optimizer, scheduler, global_step, loss, rouge1, path):
+    """Save a comprehensive training checkpoint."""
+    checkpoint = {
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': loss,
+        'rouge1': rouge1,
+    }
+    torch.save(checkpoint, path)
+    
+    # Simple verification
+    if Path(path).exists():
+        size_mb = Path(path).stat().st_size / (1024 * 1024)
+        return size_mb
+    return 0.0
 
 
 def finetune():
@@ -452,24 +410,57 @@ def finetune():
     vocab_size = tokenizer.get_vocab_size()
     print(f"Vocabulary: {vocab_size}")
     
-    # Load dataset
-    print("\nLoading CNN/DailyMail...")
-    train_data = load_dataset(
-        config['datasource'],
-        config['dataset_version'],
-        split=f"train[:{config['train_samples']}]"
-    )
-    val_data = load_dataset(
+    # Helper: safe loader that warns and returns an empty iterable if dataset missing
+    def safe_load(name, version=None, split=None):
+        try:
+            if version:
+                return load_dataset(name, version, split=split)
+            return load_dataset(name, split=split)
+        except ds_exceptions.DatasetNotFoundError:
+            print(f"Warning: dataset '{name}' not found on the Hub — skipping.")
+            return []
+
+    # Load dataset — support mixed-dataset recipes to reduce domain overfitting
+    print("\nLoading training data (mixed recipe)...")
+    train_samples = config['train_samples']
+    train_examples = []
+    if config.get('dataset_mix'):
+        for ds in config['dataset_mix']:
+            name = ds['name']
+            version = ds.get('version')
+            frac = ds.get('fraction', 0.0)
+            n = max(1, int(train_samples * frac))
+            print(f"  - Loading {n} samples from {name}{(' v'+str(version)) if version else ''}")
+            if version:
+                part = safe_load(name, version, split=f"train[:{n}]")
+            else:
+                part = safe_load(name, split=f"train[:{n}]")
+            train_examples.extend(part)
+        # Shuffle mixed examples
+        random.shuffle(train_examples)
+    else:
+        print("  - Loading CNN/DailyMail as single source")
+        train_examples = safe_load(
+            config['datasource'],
+            config['dataset_version'],
+            split=f"train[:{train_samples}]"
+        )
+
+    # Validation remains CNN/DailyMail by default
+    val_data = safe_load(
         config['datasource'],
         config['dataset_version'],
         split=f"validation[:{config['val_samples']}]"
     )
     
     train_dataset = SummarizationDataset(
-        train_data, tokenizer, config['src_seq_len'], config['tgt_seq_len']
+        train_examples, tokenizer, config['src_seq_len'], config['tgt_seq_len'],
+        lead_mask_prob=config.get('lead_mask_prob', 0.0)
     )
+    # Validation remains unmasked for strict parity check
     val_dataset = SummarizationDataset(
-        val_data, tokenizer, config['src_seq_len'], config['tgt_seq_len']
+        val_data, tokenizer, config['src_seq_len'], config['tgt_seq_len'],
+        lead_mask_prob=0.0
     )
     
     train_loader = DataLoader(
@@ -497,13 +488,16 @@ def finetune():
         use_copy=config.get('use_copy', True),
     ).to(device)
     
-    use_copy = config.get('use_copy', True) and model.copy_mechanism is not None
+    # Copy mechanism warmup: disable copy initially to let generator learn
+    copy_warmup_steps = config.get('copy_warmup_steps', 0)
+    use_copy_initially = config.get('use_copy', True) and model.copy_mechanism is not None
+    use_copy = use_copy_initially  # Will be toggled based on global_step later
     
-    # Load pretrained weights
+    # Load pretrained weights OR initialize from scratch
     pretrain_path = config.get('pretrain_weights')
     if pretrain_path and Path(pretrain_path).exists():
         print(f"\n✓ Loading pretrained weights: {pretrain_path}")
-        checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
+        checkpoint = load_checkpoint(pretrain_path, map_location=device)
         pretrained_dict = checkpoint['model_state_dict']
         model_dict = model.state_dict()
         
@@ -516,7 +510,6 @@ def finetune():
                     loaded.append(k)
                 elif 'pos.pe' in k and model_dict[k].shape[-1] == v.shape[-1]:
                     # Intelligent slicing for Positional Embeddings (Different seq_len)
-                    # v shape: (1, seq_old, d_model), model_dict shape: (1, seq_new, d_model)
                     min_seq = min(model_dict[k].shape[1], v.shape[1])
                     model_dict[k][:, :min_seq, :] = v[:, :min_seq, :]
                     loaded.append(f"{k} (sliced {min_seq} steps)")
@@ -527,6 +520,7 @@ def finetune():
         
         model.load_state_dict(model_dict)
         print(f"  Loaded {len(loaded)}/{len(pretrained_dict)} weight tensors")
+        
         if skipped:
             print(f"  Skipped {len(skipped)} (shape mismatch or new layers):")
             for s in skipped[:10]:
@@ -534,19 +528,47 @@ def finetune():
             if len(skipped) > 10:
                 print(f"    ... and {len(skipped)-10} more")
         print(f"  Pretrain loss was: {checkpoint.get('loss', 'N/A')}")
+        
+        # ── CRITICAL FIX: Reset copy mechanism bias AFTER loading weights ──
+        # The pretrained checkpoint overwrites our w_gen.bias=2.0 initialization.
+        # Without this reset, the model starts with old copy-biased weights,
+        # making it stuck in a "copying is easy" loop from Step 0.
+        if model.copy_mechanism is not None and hasattr(model.copy_mechanism, 'w_gen'):
+            old_bias = model.copy_mechanism.w_gen.bias.data.item()
+            import math
+            new_bias = 0.0  # sigmoid(0.0) = 0.5 → Neutral starting point
+            nn.init.constant_(model.copy_mechanism.w_gen.bias, new_bias)
+            print(f"  🔧 CopyMechanism bias reset: {old_bias:.4f} → {new_bias:.4f} "
+                  f"(sigmoid: {1/(1+math.exp(-old_bias)):.2f} → {1/(1+math.exp(-new_bias)):.2f})")
+            # Also reset the w_gen WEIGHT to small values so it starts "fresh"
+            # This prevents the old trained weights from immediately pulling bias back down
+            nn.init.xavier_uniform_(model.copy_mechanism.w_gen.weight)
+            print(f"  🔧 CopyMechanism w_gen.weight re-initialized (Xavier)")
+
+        
     else:
-        print("\n⚠ No pretrained weights found. Training from scratch.")
+        print("\nInitializing model from scratch (Xavier)...")
+        from model import initialize_weights
+        initialize_weights(model, n_layers=config['num_layers'])
+        
+    print(f"  Model parameter norm: {torch.norm(next(model.parameters())).item():.4f}")
     
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Reinitialize collapsed decoder heads (gives them a fresh start)
-    if config.get('reinit_decoder_heads', True):
-        reinit_collapsed_heads(model)
+    # (Removed destructive reinit_collapsed_heads call that was wiping decoder weights)
     
     # Optimizer with layer-wise LR (decoder gets lower LR to prevent collapse)
     decoder_lr_scale = config.get('decoder_lr_scale', 0.33)
     print(f"\n📊 Layer-wise Learning Rates (decoder scale: {decoder_lr_scale}):")
     param_groups = get_layerwise_param_groups(model, config['lr'], decoder_lr_scale)
+
+    # If we are doing a staged encoder unfreeze, start encoder LR at 0
+    freeze_steps = config.get('freeze_encoder_steps', 0)
+    staged_unfreeze = config.get('staged_unfreeze', False)
+    if staged_unfreeze and freeze_steps > 0:
+        for g in param_groups:
+            if g.get('group_type') == 'encoder':
+                g['lr'] = 0.0
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=config['lr'],
@@ -556,18 +578,20 @@ def finetune():
     )
     
     # Scheduler
-    total_steps = len(train_loader) * config['num_epochs'] // config['gradient_accumulation']
-    warmup_steps = config['warmup_steps']
-    
+    accumulation_steps = config['gradient_accumulation']
     import math
+    steps_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
+    total_steps = steps_per_epoch * config['num_epochs']
+    warmup_steps = config['warmup_steps']
+
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
         
-        # Cosine Annealing (from peak to 10% of peak)
+        # Cosine Annealing (from peak to 20% of peak - avoid too-low floor)
         progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return max(0.1, cosine_decay) # Decay to 10% of base LR
+        return max(0.2, cosine_decay) # Decay to 20% of base LR (safer floor)
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
@@ -589,6 +613,21 @@ def finetune():
     
     # TensorBoard
     writer = SummaryWriter(config['experiment_name'])
+    # Cockpit instrumentation (optional)
+    cockpit = None
+    if config.get('enable_cockpit', False):
+        try:
+            from cockpit_integration import Cockpit
+            cockpit = Cockpit(out_dir=config.get('cockpit_out', 'diagnostics_output/cockpit'), writer=writer)
+            # Allow Cockpit to wrap optimizer (if it provides that feature)
+            try:
+                optimizer = cockpit.attach(model, optimizer=optimizer, attn_store=None)
+            except Exception:
+                # attach may require optimizer to be present earlier; ignore if not supported
+                pass
+            print('[Cockpit] attached')
+        except Exception as e:
+            print(f'[Cockpit] failed to initialize: {e}')
     
     # Training
     # Diagnostic config
@@ -622,20 +661,69 @@ def finetune():
         progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']}")
         optimizer.zero_grad()
         
+        # Phase 19.2: Scheduled Detox (Epoch-based) - ALIGNED FOR 4-EPOCH RUN
+        # Lead Mask Prob: 0.90 -> 0.60 -> 0.30 -> 0.15 (Transitioning from Detox to Fluency)
+        # Entropy Reg: 0.002 -> 0.0017 -> 0.0015 -> 0.0010 (Reducing diversity pressure)
+        if epoch == 0:
+            current_lead_mask_prob = 0.90
+            entropy_reg_weight = 0.0020
+        elif epoch == 1:
+            current_lead_mask_prob = 0.60
+            entropy_reg_weight = 0.0017
+        elif epoch == 2:
+            current_lead_mask_prob = 0.30
+            entropy_reg_weight = 0.0015
+        else: # Epoch 4
+            current_lead_mask_prob = 0.15
+            entropy_reg_weight = 0.0010
+            
+        if hasattr(train_loader.dataset, 'lead_mask_prob'):
+            train_loader.dataset.lead_mask_prob = current_lead_mask_prob
+        
+        print(f"\n🚀 EPOCH {epoch+1} CONFIG: lead_mask_prob={current_lead_mask_prob:.2f}, entropy_reg={entropy_reg_weight:.4f}")
+        
         for batch_idx, batch in enumerate(progress):
+
             enc_input = batch['encoder_input'].to(device)
             dec_input = batch['decoder_input'].to(device)
             enc_mask = batch['encoder_mask'].to(device)
             dec_mask = batch['decoder_mask'].to(device)
             label = batch['label'].to(device)
             
+            # GENERATOR WARMUP: disable copy for first N steps so model learns generation
+            use_copy_now = use_copy_initially
+            if global_step < copy_warmup_steps:
+                use_copy_now = False  # Disable copy during warmup
+            else:
+                use_copy_now = use_copy_initially
+            
             # Forward pass with diagnostic hooks
             amp_enabled = config['use_amp']
             with autocast(enabled=amp_enabled):
-                if use_copy:
-                    final_dist, p_gen = model.forward_with_copy(
-                        enc_input, enc_mask, dec_input, dec_mask
+                if use_copy_now:
+                    # HARD POINTER DROPOUT (Nuclear Fix): Force p_gen = 1.0 for ~20% of batches
+                    # This breaks the copying plateau by occasionally forcing pure generation
+                    hard_dropout_prob = config.get('hard_pointer_dropout_prob', 0.2)
+                    force_all_gen = False
+                    if global_step >= copy_warmup_steps and torch.rand(1).item() < hard_dropout_prob:
+                        force_all_gen = True  # Force pure generation (p_gen = 1.0) for this batch
+                    
+                    # Pointer-dropout: with some probability, disable the pointer for the whole example
+                    pointer_dropout = config.get('pointer_dropout', 0.0)
+                    force_no_pointer = False
+                    if pointer_dropout > 0 and model.training:
+                        # apply same decision across the batch (paper: decision holds for all words in summary)
+                        if torch.rand(1, device=enc_input.device).item() < pointer_dropout:
+                            force_no_pointer = True
+
+                    final_dist, p_gen, live_cross_attn = model.forward_with_copy(
+                        enc_input, enc_mask, dec_input, dec_mask,
+                        force_no_pointer=force_no_pointer,
+                        force_all_gen=force_all_gen  # Hard Pointer Dropout: forces p_gen=1.0 INSIDE the model
                     )
+                    # NOTE: force_all_gen is now handled INSIDE the model, so p_gen and final_dist
+                    # are already correct. No post-hoc override needed.
+                    
                     log_probs = torch.log(final_dist + 1e-12)
                     
                     # Label smoothing for copy path
@@ -648,45 +736,95 @@ def finetune():
                     else:
                         loss = loss_fn(log_probs.view(-1, vocab_size), label.view(-1))
                 else:
+                    p_gen = None
+                    live_cross_attn = None
                     enc_out = model.encode(enc_input, enc_mask)
                     dec_out = model.decode(enc_out, enc_mask, dec_input, dec_mask)
                     logits = model.project(dec_out)
-                    loss = loss_fn(logits.view(-1, vocab_size), label.view(-1))
+                    # CRITICAL: During warmup, loss_fn is NLLLoss (expects log-probs),
+                    # but logits are RAW. Use F.cross_entropy which applies log_softmax internally.
+                    loss = F.cross_entropy(
+                        logits.view(-1, vocab_size), label.view(-1),
+                        ignore_index=tokenizer.pad_id,
+                        label_smoothing=config.get('label_smoothing', 0.0)
+                    )
                 
                 # ── Phase 8: Weighted Hybrid Loss (Refined) ──
                 # 1. Base Loss (Factual Accuracy via smooth_nll_loss) is already calculated above as 'loss'
                 base_loss = loss
                 
                 # 2. Attention Sharpening (Target 1.6 - "The Drill Sergeant")
+                # Apply entropy regularization over multiple decoder cross-attention
                 ent_reg_loss = 0.0
                 if entropy_reg_weight > 0:
                     target_ent = config.get('target_entropy', 1.6)
-                    # Use last layer cross-attention maps for target sharpening
-                    cross_layer = model.decoder.layers[-1]
-                    ca_attn = cross_layer.cross_attention_block.attention_scores
-                    if ca_attn is not None:
-                        ent_reg_loss = entropy_regularization(ca_attn, target_entropy=target_ent)
-                
-                # 3. Pointer Control (Target 0.45 - "The Gossip Filter")
+                    ent_accum = 0.0
+                    ent_count = 0
+
+                    # Last two decoder cross-attention layers (strongest signal)
+                    for layer in model.decoder.layers[-2:]:
+                        ca = getattr(layer, 'cross_attention_block', None)
+                        if ca is not None:
+                            attn = getattr(ca, 'attention_scores', None)
+                            if attn is not None:
+                                ent_accum += entropy_regularization(attn, target_entropy=target_ent)
+                                ent_count += 1
+
+                    # Also include last decoder self-attention heads (helps focus generation)
+                    for layer in model.decoder.layers[-2:]:
+                        sa = getattr(layer, 'self_attention_block', None)
+                        if sa is not None:
+                            attn = getattr(sa, 'attention_scores', None)
+                            if attn is not None:
+                                ent_accum += entropy_regularization(attn, target_entropy=target_ent)
+                                ent_count += 1
+
+                    if ent_count > 0:
+                        ent_reg_loss = ent_accum / float(ent_count)
+
+                # 3. Pointer Control (AGGRESSIVE LINEAR PENALTY)
+                # Use lambda_p * mean(1 - p_gen) instead of soft MSE (Lin et al. / Boutkan et al.)
                 pgen_loss = 0.0
-                if use_copy and p_gen is not None:
-                    pgen_loss = pgen_balance_loss(p_gen, target=0.45)
-                
-                # 4. Coverage Loss (prevents repetition)
+                apply_ptr_after = config.get('apply_pointer_loss_after_steps', 0)
+                if use_copy_now and p_gen is not None and global_step >= (copy_warmup_steps + apply_ptr_after):
+                    # NUCLEAR FIX: Use aggressive_pgen_penalty (linear) instead of soft MSE
+                    lambda_p = config.get('lambda_p', 3.0)  # High penalty for copying
+                    pgen_loss = lambda_p * aggressive_pgen_penalty(p_gen)  # mean(1 - p_gen)
+
+                # 4. Coverage Loss (prevents repetition) — uses LIVE cross_attn
                 cov_loss = 0.0
-                if use_copy and coverage_loss_weight > 0:
-                    cov_total = 0.0
-                    for layer_idx in [-1, -2]: # Multi-layer grounding
-                        target_layer = model.decoder.layers[layer_idx]
-                        at = target_layer.cross_attention_block.attention_scores
-                        if at is not None:
-                            cov_total += compute_coverage_loss(at.mean(dim=1))
-                    cov_loss = (cov_total / 2.0)
-                
+                apply_cov_after = config.get('apply_coverage_after_steps', 0)
+                if use_copy_now and coverage_loss_weight > 0 and global_step >= (copy_warmup_steps + apply_cov_after):
+                    if live_cross_attn is not None:
+                        # live_cross_attn is (B, tgt_len, src_len) — NOT detached
+                        cov_loss = compute_coverage_loss(live_cross_attn)
+
                 # 5. Combined Final Loss
-                # We use 0.05 weights as per user request to guide without overwhelming
-                loss = base_loss + (0.05 * ent_reg_loss) + (0.05 * pgen_loss) + (coverage_loss_weight * cov_loss)
-                
+                # Use explicit weights from config; avoid hidden 0.05 scaling that nullifies effect
+                pgen_weight = config.get('pgen_loss_weight', 1.0)
+
+                loss = base_loss
+                if entropy_reg_weight > 0 and ent_reg_loss is not None:
+                    loss = loss + (entropy_reg_weight * ent_reg_loss)
+                    writer.add_scalar('finetune/ent_reg_loss', float(ent_reg_loss.item() if hasattr(ent_reg_loss, 'item') else ent_reg_loss), global_step)
+
+                if use_copy_now and p_gen is not None and pgen_loss is not None:
+                    loss = loss + pgen_loss  # pgen_loss already scaled by lambda_p
+                    writer.add_scalar('finetune/pgen_loss', float(pgen_loss.item() if hasattr(pgen_loss, 'item') else pgen_loss), global_step)
+
+                loss = loss + (coverage_loss_weight * cov_loss)
+
+                # ── DIAGNOSTIC: Log per-component loss every 50 steps ──
+                if global_step % 50 == 0:
+                    _bl = float(base_loss.item()) if hasattr(base_loss, 'item') else float(base_loss)
+                    _pl = float(pgen_loss.item()) if hasattr(pgen_loss, 'item') else float(pgen_loss)
+                    _cl = float(cov_loss.item()) if hasattr(cov_loss, 'item') else float(cov_loss)
+                    _el = float(ent_reg_loss.item()) if hasattr(ent_reg_loss, 'item') else float(ent_reg_loss)
+                    _pg = float(p_gen.mean().item()) if p_gen is not None else 0.0
+                    tqdm.write(f"  [Step {global_step}] base_nll={_bl:.2f}  pgen_loss={_pl:.2f}  "
+                               f"cov_loss={coverage_loss_weight * _cl:.2f}  ent_loss={entropy_reg_weight * _el:.4f}  "
+                               f"TOTAL={float(loss.item()):.2f}  p_gen_mean={_pg:.3f}")
+
                 loss = loss / accumulation_steps
             
             # Backward
@@ -711,14 +849,29 @@ def finetune():
                     optimizer.step()
                 
                 scheduler.step()
-                optimizer.zero_grad()
                 global_step += 1
+                
+                # Log global gradient health BEFORE zeroing
+                grad_report = check_gradient_health(model, writer, global_step)
+                
+                # Print warnings only on diagnostic steps to avoid terminal spam
+                if global_step % config.get('diagnostic_every', 100) == 0:
+                    if grad_report['warnings']:
+                        for w in grad_report['warnings'][:3]:
+                            tqdm.write(f"  {w}")
                 
                 writer.add_scalar('finetune/loss', loss.item() * accumulation_steps, global_step)
                 writer.add_scalar('finetune/lr', scheduler.get_last_lr()[0], global_step)
                 
-                # Log global gradient health at every update
-                check_gradient_health(model, writer, global_step)
+                optimizer.zero_grad()
+
+                # Staged encoder unfreeze: ramp encoder LR from 0 -> base_lr over freeze_steps
+                if staged_unfreeze and freeze_steps > 0:
+                    # compute scale in [0,1]
+                    scale = min(1.0, float(global_step) / float(max(1, freeze_steps)))
+                    for pg in optimizer.param_groups:
+                        if pg.get('group_type') == 'encoder':
+                            pg['lr'] = config['lr'] * scale
                 
                 # ── Periodic diagnostics & Health ──
                 if global_step % diagnostic_every == 0:
@@ -735,28 +888,20 @@ def finetune():
                         avg_pgen = p_gen.mean().item()
                         writer.add_scalar("Diagnostics/P_Gen_Mean", avg_pgen, global_step)
 
-                # ── Head-Shock (Anti-Collapse) ──
-                if global_step % 1000 == 0:
-                    # Every 1000 steps, detect and reinitialize collapsed decoder heads
-                    reinit_collapsed_heads(model, only_decoder=True)
-                    tqdm.write("  ⚡ Head-Shock: Re-initialized stagnant attention patterns.")
+                # (Removed Head-Shock logic as it was destructively erasing decoder linear layers)
                     
                     # Log p_gen if using copy
                     if use_copy and p_gen is not None:
                         log_pgen(writer, p_gen, global_step)
                     
-                    # Gradient health check
-                    grad_report = check_gradient_health(model, writer, global_step)
-                    if grad_report['warnings']:
-                        for w in grad_report['warnings'][:3]:
-                            tqdm.write(f"  {w}")
+                    # (Gradients are checked and warnings printed at every update above)
                 
                 # ── Intra-epoch Validation ──
                 if global_step % config['save_every'] == 0:
                     # Validation with beam search + ROUGE
                     rouge_scores = run_validation(
                         model, val_loader, tokenizer, config, device,
-                        num_examples=config['num_validation_examples']
+                        num_examples=config['num_validation_examples'], num_print=5
                     )
                     
                     writer.add_scalar('finetune/rouge1', rouge_scores['rouge1'], global_step)
@@ -769,12 +914,8 @@ def finetune():
                         best_rouge = current_rouge
                         patience_counter = 0
                         best_path = Path(config['model_folder']) / f"{config['model_basename']}best.pt"
-                        torch.save({
-                            'global_step': global_step,
-                            'model_state_dict': model.state_dict(),
-                            'best_rouge1': best_rouge,
-                        }, best_path)
-                        tqdm.write(f"  ⭐ New best ROUGE-1: {best_rouge:.4f} (Saved to {best_path})")
+                        size = save_checkpoint(model, optimizer, scheduler, global_step, loss.item() * accumulation_steps, best_rouge, best_path)
+                        tqdm.write(f"  ⭐ New best ROUGE-1: {best_rouge:.4f} (Saved to {best_path}, {size:.1f}MB)")
                     else:
                         patience_counter += 1
                         if patience_counter >= config['patience']:
@@ -783,12 +924,7 @@ def finetune():
                     
                     # Periodic checkpoint
                     ckpt_path = Path(config['model_folder']) / f"{config['model_basename']}step_{global_step}.pt"
-                    torch.save({
-                        'global_step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': loss.item() * accumulation_steps,
-                    }, ckpt_path)
+                    save_checkpoint(model, optimizer, scheduler, global_step, loss.item() * accumulation_steps, current_rouge, ckpt_path)
             
             progress.set_postfix({'loss': f'{loss.item() * accumulation_steps:.3f}'})
         
@@ -800,7 +936,7 @@ def finetune():
             print("\nRunning End-of-Epoch Validation...")
             rouge_scores = run_validation(
                 model, val_loader, tokenizer, config, device,
-                num_examples=config['num_validation_examples']
+                num_examples=config['num_validation_examples'], num_print=5
             )
             
             writer.add_scalar('finetune/rouge1', rouge_scores['rouge1'], global_step)
@@ -812,14 +948,15 @@ def finetune():
                 best_rouge = current_rouge
                 patience_counter = 0
                 best_path = Path(config['model_folder']) / f"{config['model_basename']}best.pt"
-                torch.save({
-                    'global_step': global_step,
-                    'model_state_dict': model.state_dict(),
-                    'best_rouge1': best_rouge,
-                }, best_path)
-                print(f"  ⭐ New best ROUGE-1: {best_rouge:.4f} (Saved to {best_path})")
+                size = save_checkpoint(model, optimizer, scheduler, global_step, loss.item() * accumulation_steps, best_rouge, best_path)
+                print(f"  ⭐ New best ROUGE-1: {best_rouge:.4f} (Saved to {best_path}, {size:.1f}MB)")
             else:
                 patience_counter += 1
+            
+        # ── Phase 16: Mandatory Epoch Checkpoint ──
+        epoch_path = Path(config['model_folder']) / f"{config['model_basename']}epoch_{epoch+1}.pt"
+        size = save_checkpoint(model, optimizer, scheduler, global_step, loss.item() * accumulation_steps, rouge_scores['rouge1'], epoch_path)
+        print(f"  💾 Epoch {epoch+1} Checkpoint Saved: {epoch_path} ({size:.1f}MB)")
 
         # End of epoch summary
         current_rouge = rouge_scores['rouge1']

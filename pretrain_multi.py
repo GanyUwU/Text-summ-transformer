@@ -447,6 +447,10 @@ def pretrain_multi():
             only_decoder = config.get('reinit_only_decoder', True)
             reinit_collapsed_heads(model, only_decoder=only_decoder)
             print("[RESUME] Reinitialized collapsed heads as requested")
+    else:
+        print("\nInitializing model from scratch (Xavier)...")
+        from model import initialize_weights
+        initialize_weights(model)
 
     model.train()
     progress = tqdm(range(config['num_steps']), desc="Multi-Pretrain")

@@ -89,7 +89,7 @@ def get_finetune_config():
         "d_ff": 2048,
         "num_layers": 6,
         "num_heads": 8,
-        "dropout": 0.1,
+        "dropout": 0.2,           # INCREASED from 0.1 for stronger regularization
         "share_weights": True,   # Share src/tgt/projection embeddings
         "use_copy": True,        # Pointer-generator copy mechanism ON for fine-tuning
         
@@ -99,18 +99,15 @@ def get_finetune_config():
         
         # Sequence lengths
         "src_seq_len": 512,
-        "tgt_seq_len": 128,
+        "tgt_seq_len": 100, 
         
         # Training (from-scratch: higher LR + more epochs)
         # Training
         "batch_size": 4,
         "gradient_accumulation": 16, # INCREASED (was 8) for effective batch = 64
-        # Training
-        "batch_size": 4,
-        "gradient_accumulation": 16, # INCREASED (was 8) for effective batch = 64
-        "num_epochs": 4,             # Phase 8: Short "kick" phase
-        "lr": 4e-5,                  # Phase 8: Warm restart (was 5e-5)
-        "warmup_steps": 500,         # Shorter warmup for warm restart
+        "num_epochs": 4,            # Phase 11: Nuclear Option (Long-lead restart)
+        "lr": 1.5e-5,                  # Phase 11: Stable fine-tuning rate
+        "warmup_steps": 1000,        # Standard warmup for fresh restart from pretrain
         "weight_decay": 0.01,
         "grad_clip": 1.0,
         "label_smoothing": 0.1,      # REVERTED to 0.1 for stability
@@ -118,37 +115,67 @@ def get_finetune_config():
         # Mixed precision
         "use_amp": True,
         
-        # Data
-        "datasource": "cnn_dailymail",
-        "dataset_version": "3.0.0",
-        "train_samples": 100000,     # INCREASED (was 50k) for better generalization
-        "val_samples": 5000,         # BUMPED (was 2k) for more robust ROUGE metrics
+        # Data (Optimized for 1-hour feedback loop)
+        "train_samples": 50000,      # Faster iterations (was 200k)
+        "val_samples": 200,
         
-        # Phase 8: Warm restart from the absolute best weights found so far
-        "pretrain_weights": "weights_v5/summarizer_best.pt",
+        "datasource": "cnn_dailymail", # Fallback for dataset loading logic
+        "dataset_version": "3.0.0",
+        
+        # Phase 11: Nuclear Option (Start from RAW Uncorrupted Weights)
+        "pretrain_weights": "pretrain_weights_multi_fixed/pretrain_multi_fixed_best.pt",
         "preload": None,
         
         # Evaluation & Diagnostics
-        "save_every": 1000,          # More frequent validation for Phase 8
-        "diagnostic_every": 300,
-        "patience": 10,              # Give it room to find the new sharp peak
+        "save_every": 500,           # High-frequency validation (~5 times per epoch)
+        "diagnostic_every": 50,      # Monitor p_gen behavior early
+        "patience": 10,
         "eval_metric": "rouge1",
         
-        # Phase 8: Generalist Realignment (Anti-Hallucination)
-        "coverage_loss_weight": 1.0,   # Normalized in diagnostics.py
-        "entropy_reg_weight": 2e-3,    # Maintain pressure
-        "target_entropy": 1.6,         # PHASE 8: SHARPEN (was 2.5)
+        # Phase 17.2: The Nuclear Detox (Initial Phase)
+        # Goal: Violently break the identity map addiction.
+        "coverage_loss_weight": 0.6,    # High factual anchoring
+        "entropy_reg_weight": 0.002,   # High diversity pressure (Initial Detox)
+        "target_entropy": 1.6,         
+        "lead_mask_prob": 0.9,         # High feature starvation (Force unlearning)
+        "decoder_lr_scale": 10.0,      # High decoder mobility
         
-        # Checkpointing (Moving to v6 for the generalist breakthrough)
-        "model_folder": "weights_v6",
-        "model_basename": "summarizer_",
-        "experiment_name": "runs/train_v8_generalist_focus",
+        # Checkpointing
+        "model_folder": "weights_v11_nuclear",
+        "model_basename": "nuclear_summarizer_",
+        "experiment_name": "runs/train_v11_nuclear_final",
         
         "beam_size": 4,
-        "length_penalty": 1.0,
+        "length_penalty": 1.0,       # Concise (Phase 10)
         "no_repeat_ngram": 3,
-        "num_validation_examples": 5,
+        "num_validation_examples": 200, # Matches val_samples
+        # AGGRESSIVE NUCLEAR FIXES per Lin et al. / Boutkan et al. (Breaking copying plateau)
+        "pgen_loss_weight": 1.0,        # Legacy (unused with lambda_p)
+        "pgen_target": 0.45,
+        # AGGRESSIVE LINEAR PENALTY for copying (replaces MSE-based pgen_balance_loss)
+        "lambda_p": 3.0,  # HIGH multiplier on mean(1 - p_gen); increase if copy rate stays high
+        # HARD POINTER DROPOUT: force p_gen = 1.0 for ~20% of batches (breaks copying shortcut)
+        "hard_pointer_dropout_prob": 0.2,
+        # GENERATOR WARMUP: disable copy mechanism for first N steps
+        "copy_warmup_steps": 800,  # ~1 Epoch for 50k samples (was 2000)
+        # Pointer-dropout (legacy; superseded by hard_pointer_dropout_prob)
+        "pointer_dropout": 0.0,
+        # Scheduling
+        "apply_pointer_loss_after_steps": 0,
+        "apply_coverage_after_steps": 0,
+        # Cockpit for fine-tuning monitoring
+        "enable_cockpit": False,
+        "cockpit_out": "diagnostics_output/cockpit",
         "reinit_decoder_heads": False,  # Preserve specialized heads from Step 25k
+        # Phase 10: Anchor Restoration Mix (CNN/DM + XSum mix)
+        "dataset_mix": [
+            {"name": "cnn_dailymail", "version": "3.0.0", "fraction": 1.0},  # 50k (factual grounding)
+            #{"name": "xsum", "fraction": 0.3},                               # 40k (extreme abstraction)
+            #{"name": "knkarthick/samsum", "fraction": 0.1},                 # 10k (Dialogue)
+        ],
+        # Staged unfreeze: keep encoder effectively frozen and ramp its LR over this many steps
+        "freeze_encoder_steps": 400,  # ~0.5 Epoch for 50k samples (was 1000)
+        "staged_unfreeze": True,
     }   
 #         # Diagnostics (from reviewer's checklist)
 #         "entropy_reg_weight": 1e-3,       # Attention entropy regularization
