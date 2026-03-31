@@ -4,7 +4,7 @@ import math
 
 class LayerNormalization(nn.Module):
 
-    def __init__(self, features: int, eps:float=10**-6) -> None:
+    def __init__(self, features: int, eps:float=1e-5) -> None:
         super().__init__()
         self.eps = eps
         self.alpha = nn.Parameter(torch.ones(features)) # alpha is a learnable parameter
@@ -99,83 +99,6 @@ class ResidualConnection(nn.Module):
     def forward(self, x, sublayer):
         return x + self.dropout(sublayer(self.norm(x)))
 
-# class MultiHeadAttentionBlock(nn.Module):
-
-#     def __init__(self, d_model: int, h: int, dropout: float) -> None:
-#         super().__init__()
-#         self.d_model = d_model # Embedding vector size
-#         self.h = h # Number of heads
-#         # Make sure d_model is divisible by h
-#         assert d_model % h == 0, "d_model is not divisible by h"
-
-#         self.d_k = d_model // h # Dimension of vector seen by each head
-#         self.w_q = nn.Linear(d_model, d_model, bias=False) # Wq
-#         self.w_k = nn.Linear(d_model, d_model, bias=False) # Wk
-#         self.w_v = nn.Linear(d_model, d_model, bias=False) # Wv
-#         self.w_o = nn.Linear(d_model, d_model, bias=False) # Wo
-        
-#         # Layer normalization for Q and K to prevent attention score collapse
-#         self.ln_q = nn.LayerNorm(d_model)
-#         self.ln_k = nn.LayerNorm(d_model)
-        
-#         self.dropout = nn.Dropout(dropout)
-        
-#         # Initialize attention projections with Xavier/Glorot for better convergence
-#         nn.init.xavier_uniform_(self.w_q.weight)
-#         nn.init.xavier_uniform_(self.w_k.weight)
-#         nn.init.xavier_uniform_(self.w_v.weight)
-#         nn.init.xavier_uniform_(self.w_o.weight)
-
-#     @staticmethod
-#     def attention(query, key, value, mask, dropout: nn.Dropout):
-#         d_k = query.shape[-1]
-#         # Just apply the formula from the paper
-#         # (batch, h, seq_len, d_k) --> (batch, h, seq_len, seq_len)
-#         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
-#         if mask is not None:
-#             # Write a very low value (indicating -inf) to the positions where mask == 0
-#             # Use -1e4 for AMP (FP16) compatibility (-1e9 overflows FP16 which has max ~65504)
-#             attention_scores.masked_fill_(mask == 0, -1e4)
-#         attention_scores = attention_scores.softmax(dim=-1) # (batch, h, seq_len, seq_len) # Apply softmax
-#         if dropout is not None:
-#             attention_scores = dropout(attention_scores)
-#         # (batch, h, seq_len, seq_len) --> (batch, h, seq_len, d_k)
-#         # return attention scores which can be used for visualization
-#         return (attention_scores @ value), attention_scores
-
-#     def forward(self, q, k, v, mask, return_attn=False):
-#         query = self.w_q(q) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-#         key = self.w_k(k) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-#         value = self.w_v(v) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-        
-#         # Apply layer normalization to Q and K to stabilize attention scores
-#         query = self.ln_q(query)
-#         key = self.ln_k(key)
-        
-#                 # ---- Safety clamp to prevent Q/K norm explosion (very important) ----
-#         query = query / (query.norm(dim=-1, keepdim=True) + 1e-6)
-#         key   = key   / (key.norm(dim=-1, keepdim=True) + 1e-6)
-
-#         # (batch, seq_len, d_model) --> (batch, seq_len, h, d_k) --> (batch, h, seq_len, d_k)
-#         query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
-#         key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
-#         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
-
-#         # Calculate attention
-#         x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
-        
-#         # Combine all the heads together
-#         # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
-#         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
-
-#         # Multiply by Wo
-#         # (batch, seq_len, d_model) --> (batch, seq_len, d_model)  
-#         if return_attn:
-#             # Average attention across heads: (batch, h, tgt_len, src_len) -> (batch, tgt_len, src_len)
-#             avg_attn = self.attention_scores.mean(dim=1)
-#             return self.w_o(x), avg_attn
-#         return self.w_o(x)
-# --- Begin replacement: MultiHeadAttentionBlock ---
 class MultiHeadAttentionBlock(nn.Module):
     """
     Stable multi-head attention:
@@ -654,7 +577,6 @@ def initialize_weights(model: nn.Module, n_layers: int = 6):
         elif isinstance(module, nn.Embedding):
             w_id = id(module.weight)
             if w_id not in seen_params:
-                # Transformers often use normal dist for embeddings, but we stick to 
-                # Xavier uniform as requested, ensuring it's tied-weight safe.
-                nn.init.xavier_uniform_(module.weight)
+                # Transformers ideally use normal dist for embeddings (Phase 20 Fix)
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 seen_params.add(w_id)

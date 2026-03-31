@@ -59,6 +59,9 @@ class SummarizationDataset(Dataset):
         self.pad_id = tokenizer.pad_id
         self.bos_id = tokenizer.bos_id
         self.eos_id = tokenizer.eos_id
+        
+        # Pre-generate causal mask
+        self.causal_mask = torch.tril(torch.ones((1, tgt_seq_len, tgt_seq_len), dtype=torch.bool))
     
     def __len__(self):
         return len(self.data)
@@ -108,8 +111,9 @@ class SummarizationDataset(Dataset):
         encoder_mask = (encoder_input != self.pad_id).view(1, 1, -1)
         # Decoder mask: (1, tgt_len, tgt_len) -> batches to (B, 1, tgt_len, tgt_len)
         padding_mask = (decoder_input != self.pad_id).view(1, 1, -1)  # (1,1,T)
-        causal_mask = self._causal_mask(self.tgt_seq_len)             # (1,T,T)
-        decoder_mask = padding_mask & causal_mask  # broadcasts to (1,T,T)
+        
+        # Slicing pre-generated mask is faster than creating it every time
+        decoder_mask = padding_mask & self.causal_mask[:, :self.tgt_seq_len, :self.tgt_seq_len]
         
         return {
             'encoder_input': encoder_input,
@@ -139,10 +143,13 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
     
     use_copy = model.copy_mechanism is not None
     
-    for _ in range(max_len):
-        decoder_mask = torch.tril(
-            torch.ones((1, 1, decoder_input.size(1), decoder_input.size(1)), dtype=torch.bool)
-        ).to(device)
+    # Pre-generate causal mask for current device
+    full_causal_mask = torch.tril(torch.ones((1, 1, max_len + 1, max_len + 1), dtype=torch.bool), device=device)
+    
+    for i in range(max_len):
+        # Current length is decoder_input.size(1)
+        cur_len = decoder_input.size(1)
+        decoder_mask = full_causal_mask[:, :, :cur_len, :cur_len]
         
         with torch.no_grad():
             if use_copy:
@@ -151,6 +158,9 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
                     return_cross_attn=True
                 )
                 vocab_logits = model.project(decoder_output)
+                
+                # REFACTOR: Avoid pos_encoding recalculation every step if possible, 
+                # but for simplicity we keep it matching the model forward structure.
                 tgt_embed = model.tgt_pos(model.tgt_embed(decoder_input))
                 context_vector = torch.bmm(cross_attn, encoder_output)
                 
@@ -170,15 +180,14 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
         if repetition_penalty != 1.0:
             for token in set(generated_tokens):
                 probs[:, token] /= repetition_penalty
-            # Safety re-normalization
             probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-12)
 
         # N-Gram blocking
         if no_repeat_ngram > 0 and len(generated_tokens) >= no_repeat_ngram - 1:
             current_gram = tuple(generated_tokens[-(no_repeat_ngram-1):])
-            for i in range(len(generated_tokens) - no_repeat_ngram + 1):
-                if tuple(generated_tokens[i:i+no_repeat_ngram-1]) == current_gram:
-                    probs[:, generated_tokens[i+no_repeat_ngram-1]] = 0.0
+            for k in range(len(generated_tokens) - no_repeat_ngram + 1):
+                if tuple(generated_tokens[k:k+no_repeat_ngram-1]) == current_gram:
+                    probs[:, generated_tokens[k+no_repeat_ngram-1]] = 0.0
             probs /= (probs.sum(dim=-1, keepdim=True) + 1e-12)
 
         # Force Min Length
@@ -202,90 +211,104 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
 
 def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokenizer, max_len, device, 
                        beam_size=4, no_repeat_ngram=3, length_penalty=0.6, min_len=10):
-    """
-    Beam Search decoding with support for Copy Mechanism and N-Gram blocking.
-    """
+    # Batched Beam Search decoding with support for Copy Mechanism and N-Gram blocking.
     bos_id = tokenizer.bos_id
     eos_id = tokenizer.eos_id
     
-    # Beam: list of (token_ids, score, finished)
-    beams = [([bos_id], 0.0, False)]
+    # Pre-generate causal mask
+    full_causal_mask = torch.tril(torch.ones((1, 1, max_len + 1, max_len + 1), dtype=torch.bool), device=device)
+    
+    # Beam: list of dicts for easier batching
+    beams = [{"tokens": [bos_id], "score": 0.0, "finished": False}]
     
     use_copy = model.copy_mechanism is not None
+    batch_size = 1 # We are decoding one example at a time, but with multiple beams
     
-    for _ in range(max_len):
-        new_candidates = []
-        all_finished = True
+    for step in range(max_len):
+        candidates = []
+        active_beams = [b for b in beams if not b["finished"]]
+        finished_beams = [b for b in beams if b["finished"]]
         
-        for tokens, score, finished in beams:
-            if finished or tokens[-1] == eos_id:
-                new_candidates.append((tokens, score, True))
-                continue
-            
-            # Repetition penalty for candidate generation
-            # (Note: simpler to apply it inside the score calculation or to probs)
-            
-            all_finished = False
-            decoder_input = torch.tensor([tokens], dtype=torch.long).to(device)
-            decoder_mask = torch.tril(
-                torch.ones((1, 1, decoder_input.size(1), decoder_input.size(1)), dtype=torch.bool)
-            ).to(device)
-            
-            with torch.no_grad():
-                if use_copy:
-                    decoder_output, cross_attn = model.decode(
-                        encoder_output, encoder_mask, decoder_input, decoder_mask,
-                        return_cross_attn=True
-                    )
-                    vocab_logits = model.project(decoder_output)
-                    tgt_embed = model.tgt_pos(model.tgt_embed(decoder_input))
-                    context_vector = torch.bmm(cross_attn, encoder_output)
-                    final_dist, _ = model.copy_mechanism(
-                        decoder_output, context_vector, tgt_embed,
-                        vocab_logits, cross_attn, encoder_input_ids
-                    )
-                    probs = final_dist[0, -1, :]
-                else:
-                    decoder_output = model.decode(
-                        encoder_output, encoder_mask, decoder_input, decoder_mask
-                    )
-                    logits = model.project(decoder_output[0, -1, :])
-                    probs = torch.softmax(logits, dim=-1)
-            
-            # N-Gram blocking
-            if no_repeat_ngram > 0 and len(tokens) >= no_repeat_ngram:
-                current_gram = tuple(tokens[-(no_repeat_ngram-1):])
-                for i in range(len(tokens) - no_repeat_ngram + 1):
-                    if tuple(tokens[i:i+no_repeat_ngram-1]) == current_gram:
-                        probs[tokens[i+no_repeat_ngram-1]] = 1e-12
-            
-            # Force Min Length
-            if len(tokens) < min_len:
-                probs[eos_id] = 1e-12
-                
-            log_probs = torch.log(probs + 1e-12)
-            
-            # Get top-k transitions
-            topk_log_probs, topk_ids = torch.topk(log_probs, beam_size)
-            
-            for i in range(beam_size):
-                next_id = topk_ids[i].item()
-                next_score = score + topk_log_probs[i].item()
-                new_candidates.append((tokens + [next_id], next_score, next_id == eos_id))
-        
-        if all_finished:
+        if not active_beams:
             break
             
-        # Score normalization (Length Penalty)
-        def get_score(cand):
-            tokens, score, _ = cand
-            return score / (len(tokens) ** length_penalty)
-            
-        new_candidates.sort(key=get_score, reverse=True)
-        beams = new_candidates[:beam_size]
+        # Batch all active beams into a single forward pass
+        # shape: (num_active_beams, current_len)
+        decoder_input = torch.tensor([b["tokens"] for b in active_beams], dtype=torch.long, device=device)
+        cur_len = decoder_input.size(1)
+        decoder_mask = full_causal_mask[:, :, :cur_len, :cur_len] # (1, 1, T, T) - broadcasts to batch
         
-    # Return best beam
-    return beams[0][0]
+        # Expand encoder info for the beam batch
+        # encoder_output: (1, S, D) -> (num_active_beams, S, D)
+        exp_enc_output = encoder_output.expand(len(active_beams), -1, -1)
+        exp_enc_mask = encoder_mask.expand(len(active_beams), -1, -1, -1)
+        exp_src_id = encoder_input_ids.expand(len(active_beams), -1)
+        
+        with torch.no_grad():
+            if use_copy:
+                decoder_output, cross_attn = model.decode(
+                    exp_enc_output, exp_enc_mask, decoder_input, decoder_mask,
+                    return_cross_attn=True
+                )
+                vocab_logits = model.project(decoder_output)
+                tgt_embed = model.tgt_pos(model.tgt_embed(decoder_input))
+                context_vector = torch.bmm(cross_attn, exp_enc_output)
+                final_dist, _ = model.copy_mechanism(
+                    decoder_output, context_vector, tgt_embed,
+                    vocab_logits, cross_attn, exp_src_id
+                )
+                all_probs = final_dist[:, -1, :] # (num_active_beams, vocab_size)
+            else:
+                decoder_output = model.decode(
+                    exp_enc_output, exp_enc_mask, decoder_input, decoder_mask
+                )
+                all_probs = torch.softmax(model.project(decoder_output[:, -1, :]), dim=-1)
+        
+        # Step through each beam's probabilities
+        for i, b in enumerate(active_beams):
+            probs = all_probs[i]
+            
+            # Repetition / N-Gram penalty
+            if no_repeat_ngram > 0 and len(b["tokens"]) >= no_repeat_ngram:
+                current_gram = tuple(b["tokens"][-(no_repeat_ngram-1):])
+                for k in range(len(b["tokens"]) - no_repeat_ngram + 1):
+                    if tuple(b["tokens"][k:k+no_repeat_ngram-1]) == current_gram:
+                        probs[b["tokens"][k+no_repeat_ngram-1]] = 0.0
+                probs /= (probs.sum() + 1e-12)
+            
+            # Force Min Length
+            if len(b["tokens"]) < min_len:
+                probs[eos_id] = 0.0
+                probs /= (probs.sum() + 1e-12)
+                
+            top_probs, top_ids = torch.topk(probs, beam_size)
+            
+            for j in range(beam_size):
+                token_id = top_ids[j].item()
+                prob = top_probs[j].item()
+                new_score = b["score"] + math.log(prob + 1e-12)
+                
+                is_finished = (token_id == eos_id)
+                candidates.append({
+                    "tokens": b["tokens"] + [token_id],
+                    "score": new_score,
+                    "finished": is_finished
+                })
+        
+        # Combine with already finished beams and sort
+        all_candidates = candidates + finished_beams
+        # Length penalty
+        def get_score(cand):
+            lp = ((5.0 + len(cand["tokens"])) / 6.0) ** length_penalty
+            return cand["score"] / lp
+            
+        beams = sorted(all_candidates, key=get_score, reverse=True)[:beam_size]
+        
+        if all(b["finished"] for b in beams):
+            break
+            
+    return beams[0]["tokens"]
+
 
 
 def compute_rouge(predictions, references):
@@ -562,13 +585,8 @@ def finetune():
     print(f"\n📊 Layer-wise Learning Rates (decoder scale: {decoder_lr_scale}):")
     param_groups = get_layerwise_param_groups(model, config['lr'], decoder_lr_scale)
 
-    # If we are doing a staged encoder unfreeze, start encoder LR at 0
-    freeze_steps = config.get('freeze_encoder_steps', 0)
-    staged_unfreeze = config.get('staged_unfreeze', False)
-    if staged_unfreeze and freeze_steps > 0:
-        for g in param_groups:
-            if g.get('group_type') == 'encoder':
-                g['lr'] = 0.0
+    # CRITICAL: We NO LONGER set group['lr'] = 0.0 here.
+    # We keep the base LR so the LambdaLR scheduler can multiply it by 0.0/1.0.
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=config['lr'],
@@ -584,16 +602,27 @@ def finetune():
     total_steps = steps_per_epoch * config['num_epochs']
     warmup_steps = config['warmup_steps']
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        
-        # Cosine Annealing (from peak to 20% of peak - avoid too-low floor)
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return max(0.2, cosine_decay) # Decay to 20% of base LR (safer floor)
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # Multi-lambda scheduler to handle staged unfreeze correctly.
+    # LambdaLR multiplies the *initial* LR of each group.
+    # We must start with full LR in optimizer and use 0.0 factor in lambda.
+    def get_lr_lambda(group_type):
+        def _lambda(step):
+            # 1. Staged Unfreeze for Encoder
+            if group_type == 'encoder' and staged_unfreeze and step < freeze_steps:
+                return 0.0
+            
+            # 2. Standard Warmup
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            
+            # 3. Cosine Annealing
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(0.2, cosine_decay)
+        return _lambda
+
+    lambdas = [get_lr_lambda(pg.get('group_type')) for pg in param_groups]
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambdas)
     
     # AMP
     scaler = GradScaler() if config['use_amp'] else None
@@ -776,7 +805,8 @@ def finetune():
                         if sa is not None:
                             attn = getattr(sa, 'attention_scores', None)
                             if attn is not None:
-                                ent_accum += entropy_regularization(attn, target_entropy=target_ent)
+                                # attn is already detached in model.py, but we ensure it here
+                                ent_accum += entropy_regularization(attn.detach(), target_entropy=target_ent)
                                 ent_count += 1
 
                     if ent_count > 0:

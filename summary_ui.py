@@ -1,7 +1,9 @@
 import gradio as gr
 import torch
+from pathlib import Path
 import torch.nn.functional as F
 from inference import load_model, summarize, _causal_mask
+from checkpoint_utils import load_checkpoint
 from pretrain_config import get_finetune_config
 
 # --- Load Model & Config (Cached) ---
@@ -9,9 +11,27 @@ def get_model():
     """Load model once and cache it."""
     try:
         config = get_finetune_config()
+        
+        # Override the loading folder for inference explicitly to use Phase 8 weights
+        config['model_folder'] = 'weights_v11_nuclear'
+        
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Loading model on {device}...")
         model, tokenizer = load_model(config, device)
+
+        # If a specific step checkpoint is required, attempt to load and override.
+        specific_ckpt = Path('weights_v11_nuclear/nuclear_summarizer_best.pt')
+        if specific_ckpt.exists():
+            try:
+                ck = load_checkpoint(str(specific_ckpt), map_location=device)
+                if 'model_state_dict' in ck:
+                    model.load_state_dict(ck['model_state_dict'])
+                    print(f"Overrode loaded weights with {specific_ckpt}")
+                else:
+                    print(f"Checkpoint {specific_ckpt} missing 'model_state_dict'; skipping")
+            except Exception as e:
+                print(f"Failed to load specific checkpoint {specific_ckpt}: {e}")
+
         return model, tokenizer, config, device
     except Exception as e:
         print(f"Error loading model: {e}")
@@ -72,7 +92,7 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
             
             with gr.Accordion("Advanced Settings", open=True):
                 max_len_slider = gr.Slider(
-                    minimum=50, maximum=300, value=128, step=1, 
+                    minimum=50, maximum=300, value=150, step=10, 
                     label="Max Summary Length"
                 )
                 min_len_slider = gr.Slider(
