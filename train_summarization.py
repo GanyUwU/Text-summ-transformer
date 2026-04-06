@@ -23,6 +23,7 @@ import warnings
 from tqdm import tqdm
 from pathlib import Path
 import heapq
+import math
 
 from datasets import load_dataset, exceptions as ds_exceptions
 import random
@@ -34,8 +35,7 @@ from diagnostics import (
     get_layerwise_param_groups, reinit_collapsed_heads,
     compute_coverage_loss, entropy_regularization,
     log_attention_entropy, log_pgen, check_gradient_health,
-    print_diagnostic_summary, smooth_nll_loss, pgen_balance_loss,
-    aggressive_pgen_penalty  # NUCLEAR FIX: aggressive linear penalty for copying
+    print_diagnostic_summary, smooth_nll_loss, pgen_balance_loss
 )
 
 try:
@@ -215,8 +215,7 @@ def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, t
     bos_id = tokenizer.bos_id
     eos_id = tokenizer.eos_id
     
-    # Pre-generate causal mask
-    full_causal_mask = torch.tril(torch.ones((1, 1, max_len + 1, max_len + 1), dtype=torch.bool), device=device)
+    full_causal_mask = torch.tril(torch.ones((1, 1, max_len + 1, max_len + 1), dtype=torch.bool, device=device))
     
     # Beam: list of dicts for easier batching
     beams = [{"tokens": [bos_id], "score": 0.0, "finished": False}]
@@ -601,6 +600,8 @@ def finetune():
     steps_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
     total_steps = steps_per_epoch * config['num_epochs']
     warmup_steps = config['warmup_steps']
+    staged_unfreeze = config.get('staged_unfreeze', False)
+    freeze_steps = config.get('freeze_steps', 0)
 
     # Multi-lambda scheduler to handle staged unfreeze correctly.
     # LambdaLR multiplies the *initial* LR of each group.
@@ -730,9 +731,9 @@ def finetune():
             amp_enabled = config['use_amp']
             with autocast(enabled=amp_enabled):
                 if use_copy_now:
-                    # HARD POINTER DROPOUT (Nuclear Fix): Force p_gen = 1.0 for ~20% of batches
+                    # HARD POINTER DROPOUT (Nuclear Fix): Force p_gen = 1.0 for ~5% of batches
                     # This breaks the copying plateau by occasionally forcing pure generation
-                    hard_dropout_prob = config.get('hard_pointer_dropout_prob', 0.2)
+                    hard_dropout_prob = config.get('hard_pointer_dropout_prob', 0.05)
                     force_all_gen = False
                     if global_step >= copy_warmup_steps and torch.rand(1).item() < hard_dropout_prob:
                         force_all_gen = True  # Force pure generation (p_gen = 1.0) for this batch
@@ -775,18 +776,23 @@ def finetune():
                     loss = F.cross_entropy(
                         logits.view(-1, vocab_size), label.view(-1),
                         ignore_index=tokenizer.pad_id,
-                        label_smoothing=config.get('label_smoothing', 0.0)
+                        label_smoothing=0.1  # Fix 5: Apply label smoothing globally
                     )
                 
                 # ── Phase 8: Weighted Hybrid Loss (Refined) ──
                 # 1. Base Loss (Factual Accuracy via smooth_nll_loss) is already calculated above as 'loss'
-                base_loss = loss
+                # Smooth log-loss already handles sum()/mask.sum() averaging
+                base_loss = loss 
                 
                 # 2. Attention Sharpening (Target 1.6 - "The Drill Sergeant")
                 # Apply entropy regularization over multiple decoder cross-attention
                 ent_reg_loss = 0.0
-                if entropy_reg_weight > 0:
-                    target_ent = config.get('target_entropy', 1.6)
+                lambda_attn = config.get('lambda_attn', 0.02)
+                if lambda_attn > 0:
+                    import math
+                    # Use unpadded source length for true entropy max
+                    src_len = enc_mask.sum(dim=-1).float()  # [B]
+                    target_ent = (0.3 * torch.log(src_len + 1e-9)).mean().item()
                     ent_accum = 0.0
                     ent_count = 0
 
@@ -805,44 +811,39 @@ def finetune():
                         if sa is not None:
                             attn = getattr(sa, 'attention_scores', None)
                             if attn is not None:
-                                # attn is already detached in model.py, but we ensure it here
-                                ent_accum += entropy_regularization(attn.detach(), target_entropy=target_ent)
+                                ent_accum += entropy_regularization(attn, target_entropy=target_ent)
                                 ent_count += 1
 
                     if ent_count > 0:
                         ent_reg_loss = ent_accum / float(ent_count)
 
-                # 3. Pointer Control (AGGRESSIVE LINEAR PENALTY)
-                # Use lambda_p * mean(1 - p_gen) instead of soft MSE (Lin et al. / Boutkan et al.)
+                # 3. Pointer Control
                 pgen_loss = 0.0
                 apply_ptr_after = config.get('apply_pointer_loss_after_steps', 0)
                 if use_copy_now and p_gen is not None and global_step >= (copy_warmup_steps + apply_ptr_after):
-                    # NUCLEAR FIX: Use aggressive_pgen_penalty (linear) instead of soft MSE
-                    lambda_p = config.get('lambda_p', 3.0)  # High penalty for copying
-                    pgen_loss = lambda_p * aggressive_pgen_penalty(p_gen)  # mean(1 - p_gen)
+                    lambda_p = 0.2  # Fix 4: Adjusted p_gen regularizer scale
+                    pgen_loss = lambda_p * pgen_balance_loss(p_gen, target=0.5)
 
                 # 4. Coverage Loss (prevents repetition) — uses LIVE cross_attn
                 cov_loss = 0.0
                 apply_cov_after = config.get('apply_coverage_after_steps', 0)
-                if use_copy_now and coverage_loss_weight > 0 and global_step >= (copy_warmup_steps + apply_cov_after):
+                lambda_cov = coverage_loss_weight
+                if use_copy_now and lambda_cov > 0 and global_step >= (copy_warmup_steps + apply_cov_after):
                     if live_cross_attn is not None:
-                        # live_cross_attn is (B, tgt_len, src_len) — NOT detached
+                        # Coverage is already normalized per step inside compute_coverage_loss
                         cov_loss = compute_coverage_loss(live_cross_attn)
 
                 # 5. Combined Final Loss
-                # Use explicit weights from config; avoid hidden 0.05 scaling that nullifies effect
-                pgen_weight = config.get('pgen_loss_weight', 1.0)
-
                 loss = base_loss
-                if entropy_reg_weight > 0 and ent_reg_loss is not None:
-                    loss = loss + (entropy_reg_weight * ent_reg_loss)
+                if lambda_attn > 0 and ent_reg_loss is not None:
+                    loss = loss + (lambda_attn * ent_reg_loss)
                     writer.add_scalar('finetune/ent_reg_loss', float(ent_reg_loss.item() if hasattr(ent_reg_loss, 'item') else ent_reg_loss), global_step)
 
                 if use_copy_now and p_gen is not None and pgen_loss is not None:
-                    loss = loss + pgen_loss  # pgen_loss already scaled by lambda_p
+                    loss = loss + pgen_loss
                     writer.add_scalar('finetune/pgen_loss', float(pgen_loss.item() if hasattr(pgen_loss, 'item') else pgen_loss), global_step)
 
-                loss = loss + (coverage_loss_weight * cov_loss)
+                loss = loss + (lambda_cov * cov_loss)
 
                 # ── DIAGNOSTIC: Log per-component loss every 50 steps ──
                 if global_step % 50 == 0:
@@ -852,7 +853,7 @@ def finetune():
                     _el = float(ent_reg_loss.item()) if hasattr(ent_reg_loss, 'item') else float(ent_reg_loss)
                     _pg = float(p_gen.mean().item()) if p_gen is not None else 0.0
                     tqdm.write(f"  [Step {global_step}] base_nll={_bl:.2f}  pgen_loss={_pl:.2f}  "
-                               f"cov_loss={coverage_loss_weight * _cl:.2f}  ent_loss={entropy_reg_weight * _el:.4f}  "
+                               f"cov_loss={lambda_cov * _cl:.2f}  ent_loss={lambda_attn * _el:.4f}  "
                                f"TOTAL={float(loss.item()):.2f}  p_gen_mean={_pg:.3f}")
 
                 loss = loss / accumulation_steps

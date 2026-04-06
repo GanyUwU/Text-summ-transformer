@@ -37,21 +37,34 @@ def reinit_collapsed_heads(model, only_decoder: bool = True):
                 pass
 
 
-def compute_coverage_loss(attn_mean: torch.Tensor):
-    # attn_mean expected [B, T, S] or [B, H, T, S]
-    if attn_mean.dim() == 4:
-        attn_mean = attn_mean.mean(dim=1)
-    cov = torch.clamp(attn_mean.cumsum(dim=1) - 1.0, min=0.0)
-    return cov.mean()
+def compute_coverage_loss(attn: torch.Tensor):
+    # attn expected [B, T, S] or [B, H, T, S]
+    # Avoid collapsing heads if 4D so we catch per-head repetition
+    if attn.dim() == 3:
+        # Expand [B, T, S] -> [B, 1, T, S] for uniform processing
+        attn = attn.unsqueeze(1)
+        
+    # Vectorized step-wise accumulation (causally shifted by subtracting current step)
+    cov = torch.cumsum(attn, dim=2) - attn
+    # Clamp to prevent unbounded late-sequence penalization
+    cov = torch.clamp(cov, max=1.0)
+    
+    # Calculate penalty and average across Batch, Head, and Time dimensions
+    return torch.min(attn, cov).sum(dim=-1).mean()
 
 
 def entropy_regularization(attn: torch.Tensor, target_entropy: float = 1.6):
     # attn shape: [B, H, T, S]
-    eps = 1e-12
+    eps = 1e-9
     ent = -(attn * (attn + eps).log()).sum(-1)  # [B, H, T]
-    mean_ent = ent.mean()
-    # Penalty when entropy is larger than target (we want lower entropy)
-    penalty = torch.relu(mean_ent - target_entropy)
+    
+    if ent.dim() == 3:
+        head_ent = ent.mean(dim=[0, 2])  # [H] — regularize EACH head distinctly
+        penalty = ((head_ent - target_entropy) ** 2).mean()
+    else:
+        # Fallback if 2D [B, T]
+        penalty = ((ent.mean() - target_entropy) ** 2)
+        
     return penalty
 
 
@@ -121,17 +134,8 @@ def smooth_nll_loss(log_probs, targets, ignore_index=0, label_smoothing=0.0, smo
         return loss_fn(log_probs_flat, targets_flat)
 
 
-def pgen_balance_loss(p_gen: torch.Tensor, target: float = 0.45):
-    """Legacy soft MSE-based p_gen penalty (used when lambda_p is not configured)."""
-    return (p_gen.mean() - target) ** 2
+def pgen_balance_loss(p_gen: torch.Tensor, target: float = 0.5):
+    """Sequence-level MSE-based p_gen penalty. Allows token variance."""
+    return ((p_gen.mean(dim=1) - target) ** 2).mean()
 
 
-def aggressive_pgen_penalty(p_gen: torch.Tensor):
-    """AGGRESSIVE LINEAR PENALTY for copying (Boutkan et al.).
-    
-    Penalizes (1 - p_gen) directly: high penalty when model copies (p_gen → 0).
-    This is much stricter than MSE and forces the model to abandon the copying plateau.
-    
-    Loss = mean(1 - p_gen) → encourages p_gen toward 1 (generation).
-    """
-    return torch.mean(1.0 - p_gen)
