@@ -289,10 +289,9 @@ class ProjectionLayer(nn.Module):
         self.d_model = d_model
         self.proj = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x) -> None:
+    def forward(self, x):
         # (batch, seq_len, d_model) --> (batch, seq_len, vocab_size)
-        # Scale tied logits to prevent explosion (since embeddings are scaled by sqrt(d_model))
-        return self.proj(x) / math.sqrt(self.d_model)
+        return self.proj(x)
 
 
 class CopyMechanism(nn.Module):

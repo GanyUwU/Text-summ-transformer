@@ -672,7 +672,7 @@ def main():
     if len(sys.argv) > 1:
         checkpoint_path = sys.argv[1]
     else:
-        checkpoint_path = "pretrain_weights_multi/pretrain_multi_best.pt"
+        checkpoint_path = "pretrain_weights_multi_fixed/pretrain_multi_fixed_best.pt"
     
     print(f"Loading checkpoint: {checkpoint_path}")
     tokenizer = get_tokenizer(config['tokenizer_model'])
@@ -693,7 +693,7 @@ def main():
         dropout=config['dropout'], d_ff=config['d_ff'], share_weights=config.get('share_weights', True), use_copy=False,
     ).to(device)
     
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     model.load_state_dict(state_dict, strict=False)
     model.eval()

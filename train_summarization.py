@@ -35,7 +35,7 @@ from diagnostics import (
     get_layerwise_param_groups, reinit_collapsed_heads,
     compute_coverage_loss, entropy_regularization,
     log_attention_entropy, log_pgen, check_gradient_health,
-    print_diagnostic_summary, smooth_nll_loss, pgen_balance_loss
+    print_diagnostic_summary, smooth_nll_loss, force_generation_loss
 )
 
 try:
@@ -134,12 +134,14 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
                  no_repeat_ngram=3, repetition_penalty=1.2, min_len=10):
     """
     Greedy decoding with support for Copy Mechanism and N-Gram blocking.
+    Returns: (list of token_ids, mean_pgen)
     """
     bos_id = tokenizer.bos_id
     eos_id = tokenizer.eos_id
     
     decoder_input = torch.tensor([[bos_id]], dtype=torch.long).to(device)
     generated_tokens = []
+    pgen_values = []
     
     use_copy = model.copy_mechanism is not None
     
@@ -147,7 +149,6 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
     full_causal_mask = torch.tril(torch.ones((1, 1, max_len + 1, max_len + 1), dtype=torch.bool), device=device)
     
     for i in range(max_len):
-        # Current length is decoder_input.size(1)
         cur_len = decoder_input.size(1)
         decoder_mask = full_causal_mask[:, :, :cur_len, :cur_len]
         
@@ -158,9 +159,6 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
                     return_cross_attn=True
                 )
                 vocab_logits = model.project(decoder_output)
-                
-                # REFACTOR: Avoid pos_encoding recalculation every step if possible, 
-                # but for simplicity we keep it matching the model forward structure.
                 tgt_embed = model.tgt_pos(model.tgt_embed(decoder_input))
                 context_vector = torch.bmm(cross_attn, encoder_output)
                 
@@ -169,6 +167,7 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
                     vocab_logits, cross_attn, encoder_input_ids
                 )
                 probs = final_dist[:, -1, :]
+                pgen_values.append(p_gen[:, -1].item())
             else:
                 decoder_output = model.decode(
                     encoder_output, encoder_mask, decoder_input, decoder_mask
@@ -206,19 +205,21 @@ def greedy_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokeni
             torch.tensor([[next_token]], dtype=torch.long).to(device)
         ], dim=1)
             
-    return [bos_id] + generated_tokens
+    avg_pgen = sum(pgen_values) / len(pgen_values) if pgen_values else 1.0
+    return [bos_id] + generated_tokens, avg_pgen
 
 
 def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, tokenizer, max_len, device, 
                        beam_size=4, no_repeat_ngram=3, length_penalty=0.6, min_len=10):
     # Batched Beam Search decoding with support for Copy Mechanism and N-Gram blocking.
+    # Returns: (list of token_ids, mean_pgen)
     bos_id = tokenizer.bos_id
     eos_id = tokenizer.eos_id
     
     full_causal_mask = torch.tril(torch.ones((1, 1, max_len + 1, max_len + 1), dtype=torch.bool, device=device))
     
     # Beam: list of dicts for easier batching
-    beams = [{"tokens": [bos_id], "score": 0.0, "finished": False}]
+    beams = [{"tokens": [bos_id], "score": 0.0, "finished": False, "pgen_sum": 0.0, "pgen_count": 0}]
     
     use_copy = model.copy_mechanism is not None
     batch_size = 1 # We are decoding one example at a time, but with multiple beams
@@ -231,14 +232,10 @@ def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, t
         if not active_beams:
             break
             
-        # Batch all active beams into a single forward pass
-        # shape: (num_active_beams, current_len)
         decoder_input = torch.tensor([b["tokens"] for b in active_beams], dtype=torch.long, device=device)
         cur_len = decoder_input.size(1)
-        decoder_mask = full_causal_mask[:, :, :cur_len, :cur_len] # (1, 1, T, T) - broadcasts to batch
+        decoder_mask = full_causal_mask[:, :, :cur_len, :cur_len] 
         
-        # Expand encoder info for the beam batch
-        # encoder_output: (1, S, D) -> (num_active_beams, S, D)
         exp_enc_output = encoder_output.expand(len(active_beams), -1, -1)
         exp_enc_mask = encoder_mask.expand(len(active_beams), -1, -1, -1)
         exp_src_id = encoder_input_ids.expand(len(active_beams), -1)
@@ -252,20 +249,22 @@ def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, t
                 vocab_logits = model.project(decoder_output)
                 tgt_embed = model.tgt_pos(model.tgt_embed(decoder_input))
                 context_vector = torch.bmm(cross_attn, exp_enc_output)
-                final_dist, _ = model.copy_mechanism(
+                final_dist, p_gen = model.copy_mechanism(
                     decoder_output, context_vector, tgt_embed,
                     vocab_logits, cross_attn, exp_src_id
                 )
-                all_probs = final_dist[:, -1, :] # (num_active_beams, vocab_size)
+                all_probs = final_dist[:, -1, :] 
+                all_pgen = p_gen[:, -1] # (num_active_beams)
             else:
                 decoder_output = model.decode(
                     exp_enc_output, exp_enc_mask, decoder_input, decoder_mask
                 )
                 all_probs = torch.softmax(model.project(decoder_output[:, -1, :]), dim=-1)
+                all_pgen = None
         
-        # Step through each beam's probabilities
         for i, b in enumerate(active_beams):
             probs = all_probs[i]
+            cur_pgen = all_pgen[i].item() if all_pgen is not None else 1.0
             
             # Repetition / N-Gram penalty
             if no_repeat_ngram > 0 and len(b["tokens"]) >= no_repeat_ngram:
@@ -291,12 +290,12 @@ def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, t
                 candidates.append({
                     "tokens": b["tokens"] + [token_id],
                     "score": new_score,
-                    "finished": is_finished
+                    "finished": is_finished,
+                    "pgen_sum": b["pgen_sum"] + cur_pgen,
+                    "pgen_count": b["pgen_count"] + 1
                 })
         
-        # Combine with already finished beams and sort
         all_candidates = candidates + finished_beams
-        # Length penalty
         def get_score(cand):
             lp = ((5.0 + len(cand["tokens"])) / 6.0) ** length_penalty
             return cand["score"] / lp
@@ -306,7 +305,9 @@ def beam_search_decode(model, encoder_output, encoder_mask, encoder_input_ids, t
         if all(b["finished"] for b in beams):
             break
             
-    return beams[0]["tokens"]
+    best_beam = beams[0]
+    avg_pgen = best_beam["pgen_sum"] / best_beam["pgen_count"] if best_beam["pgen_count"] > 0 else 1.0
+    return best_beam["tokens"], avg_pgen
 
 
 
@@ -334,6 +335,7 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5,
     
     predictions = []
     references = []
+    pgen_history = []
     
     print("\n" + "-"*60)
     print("VALIDATION")
@@ -355,7 +357,7 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5,
             
             # Decode - Use Beam Search if beam_size > 1
             if config.get('beam_size', 1) > 1:
-                out_ids = beam_search_decode(
+                out_ids, avg_pgen = beam_search_decode(
                     model, enc_out, encoder_mask, encoder_input,
                     tokenizer, config['tgt_seq_len'], device,
                     beam_size=config['beam_size'],
@@ -363,11 +365,13 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5,
                     length_penalty=config.get('length_penalty', 0.8)
                 )
             else:
-                out_ids = greedy_decode(
+                out_ids, avg_pgen = greedy_decode(
                     model, enc_out, encoder_mask, encoder_input,
                     tokenizer, config['tgt_seq_len'], device,
                     no_repeat_ngram=config.get('no_repeat_ngram', 3)
                 )
+            
+            pgen_history.append(avg_pgen)
             
             # Decode to text
             decoded = tokenizer.decode(out_ids)
@@ -384,16 +388,21 @@ def run_validation(model, val_loader, tokenizer, config, device, num_examples=5,
                 print(f"\nExample {i+1}:")
                 print(f"  REF: {ref_text}")
                 print(f"  GEN: {decoded}")
+                print(f"  p_gen: {avg_pgen:.3f}")
     
     # Compute ROUGE
     rouge_scores = compute_rouge(predictions, references)
+    mean_pgen = sum(pgen_history) / len(pgen_history) if pgen_history else 1.0
+    copy_rate = 100 * (1.0 - mean_pgen)
     
     print(f"\nROUGE Scores (n={len(predictions)}):")
     print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}")
     print(f"  ROUGE-2: {rouge_scores['rouge2']:.4f}")
     print(f"  ROUGE-L: {rouge_scores['rougeL']:.4f}")
+    print(f"  Copy Rate: {copy_rate:.2f}%")
     print("-" * 60)
     
+    rouge_scores['copy_rate'] = copy_rate
     return rouge_scores
 
 
@@ -426,6 +435,8 @@ def finetune():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
+    print(f"Config Settings: d_model={config['d_model']}, layers={config['num_layers']}, heads={config['num_heads']}")
+    print(f"Sequence Lengths: src={config['src_seq_len']}, tgt={config['tgt_seq_len']}")
     
     # Load tokenizer
     tokenizer = get_tokenizer(config['tokenizer_model'])
@@ -468,12 +479,26 @@ def finetune():
             split=f"train[:{train_samples}]"
         )
 
-    # Validation remains CNN/DailyMail by default
-    val_data = safe_load(
-        config['datasource'],
-        config['dataset_version'],
-        split=f"validation[:{config['val_samples']}]"
-    )
+    # Validation: Follow the mix if present, otherwise fallback to datasource
+    print("Loading validation data (mixed recipe)...")
+    val_data = []
+    if config.get('dataset_mix'):
+        val_samples_per_ds = max(1, config['val_samples'] // len(config['dataset_mix']))
+        for ds in config['dataset_mix']:
+            name = ds['name']
+            version = ds.get('version')
+            print(f"  - Loading {val_samples_per_ds} samples from {name} (valid)")
+            if version:
+                part = safe_load(name, version, split=f"validation[:{val_samples_per_ds}]")
+            else:
+                part = safe_load(name, split=f"validation[:{val_samples_per_ds}]")
+            val_data.extend(part)
+    else:
+        val_data = safe_load(
+            config['datasource'],
+            config['dataset_version'],
+            split=f"validation[:{config['val_samples']}]"
+        )
     
     train_dataset = SummarizationDataset(
         train_examples, tokenizer, config['src_seq_len'], config['tgt_seq_len'],
@@ -558,7 +583,7 @@ def finetune():
         if model.copy_mechanism is not None and hasattr(model.copy_mechanism, 'w_gen'):
             old_bias = model.copy_mechanism.w_gen.bias.data.item()
             import math
-            new_bias = 0.0  # sigmoid(0.0) = 0.5 → Neutral starting point
+            new_bias = 1.5  # sigmoid(1.5) approx 0.82 → Moderate generation prior
             nn.init.constant_(model.copy_mechanism.w_gen.bias, new_bias)
             print(f"  🔧 CopyMechanism bias reset: {old_bias:.4f} → {new_bias:.4f} "
                   f"(sigmoid: {1/(1+math.exp(-old_bias)):.2f} → {1/(1+math.exp(-new_bias)):.2f})")
@@ -697,20 +722,30 @@ def finetune():
         if epoch == 0:
             current_lead_mask_prob = 0.90
             entropy_reg_weight = 0.0020
+            current_lambda_p = 1.0
+            current_hard_dropout = 0.2
         elif epoch == 1:
             current_lead_mask_prob = 0.60
             entropy_reg_weight = 0.0017
+            current_lambda_p = 3.0
+            current_hard_dropout = 0.3
         elif epoch == 2:
             current_lead_mask_prob = 0.30
             entropy_reg_weight = 0.0015
-        else: # Epoch 4
+            current_lambda_p = 5.0
+            current_hard_dropout = 0.4
+        else: # Epoch 4+
             current_lead_mask_prob = 0.15
             entropy_reg_weight = 0.0010
+            current_lambda_p = 2.0
+            current_hard_dropout = 0.4
             
         if hasattr(train_loader.dataset, 'lead_mask_prob'):
             train_loader.dataset.lead_mask_prob = current_lead_mask_prob
         
-        print(f"\n🚀 EPOCH {epoch+1} CONFIG: lead_mask_prob={current_lead_mask_prob:.2f}, entropy_reg={entropy_reg_weight:.4f}")
+        print(f"\n🚀 EPOCH {epoch+1} CONFIG: lead_mask={current_lead_mask_prob:.2f}, "
+              f"ent_reg={entropy_reg_weight:.4f}, lambda_p={current_lambda_p:.1f}, "
+              f"hard_dropout={current_hard_dropout:.2f}")
         
         for batch_idx, batch in enumerate(progress):
 
@@ -732,10 +767,9 @@ def finetune():
             with autocast(enabled=amp_enabled):
                 if use_copy_now:
                     # HARD POINTER DROPOUT (Nuclear Fix): Force p_gen = 1.0 for ~5% of batches
-                    # This breaks the copying plateau by occasionally forcing pure generation
-                    hard_dropout_prob = config.get('hard_pointer_dropout_prob', 0.05)
+                    # This breaks the copying plateau by occasionally forcing pure generation (Schedules: 0.2 -> 0.4)
                     force_all_gen = False
-                    if global_step >= copy_warmup_steps and torch.rand(1).item() < hard_dropout_prob:
+                    if global_step >= copy_warmup_steps and torch.rand(1).item() < current_hard_dropout:
                         force_all_gen = True  # Force pure generation (p_gen = 1.0) for this batch
                     
                     # Pointer-dropout: with some probability, disable the pointer for the whole example
@@ -817,12 +851,11 @@ def finetune():
                     if ent_count > 0:
                         ent_reg_loss = ent_accum / float(ent_count)
 
-                # 3. Pointer Control
+                # 3. Pointer Control (Asymmetric Force - Scheduled Curriculm)
                 pgen_loss = 0.0
                 apply_ptr_after = config.get('apply_pointer_loss_after_steps', 0)
                 if use_copy_now and p_gen is not None and global_step >= (copy_warmup_steps + apply_ptr_after):
-                    lambda_p = 0.2  # Fix 4: Adjusted p_gen regularizer scale
-                    pgen_loss = lambda_p * pgen_balance_loss(p_gen, target=0.5)
+                    pgen_loss = current_lambda_p * force_generation_loss(p_gen)
 
                 # 4. Coverage Loss (prevents repetition) — uses LIVE cross_attn
                 cov_loss = 0.0

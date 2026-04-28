@@ -1,121 +1,212 @@
 import numpy as np
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
+
 try:
-    from sentence_transformers import SentenceTransformer, util
+    from sentence_transformers import SentenceTransformer
 except ImportError:
     SentenceTransformer = None
 
+
 class SemanticAnalyzer:
     """
-    Uses Sentence-BERT to analyze the semantic fidelity of internal representations.
-    Tracks how the "meaning" of a sentence changes as it passes through layers.
+    Analyzes representational quality using two complementary methods:
+    
+    1. Logit Lens (Nostalgebraist 2020): Projects residual stream at each layer
+       through the unembedding matrix to see what the model "predicts" at each
+       depth. Healthy models show monotonically increasing confidence.
+       
+    2. Layer-to-layer CKA (Kornblith et al. 2019): Measures representational
+       similarity between consecutive layers using Centered Kernel Alignment,
+       which is invariant to isotropic scaling and orthogonal transformations.
+       
+    These replace the previous SBERT random-projection approach, which was
+    methodologically unsound (random projections do not preserve semantic
+    structure, making cosine similarity in the projected space uninterpretable).
     """
     
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         self.model_name = model_name
+        # SBERT kept as optional for backward compatibility, but no longer
+        # used as the primary semantic metric.
         self.sbert = None
         if SentenceTransformer:
             try:
                 self.sbert = SentenceTransformer(model_name)
-            except Exception as e:
-                print(f"Warning: Could not load SBERT model {model_name}: {e}")
-        self._projections = {}
+            except Exception:
+                pass
 
-    def _get_projection(self, in_dim: int, out_dim: int) -> np.ndarray:
-        """Creates or retrieves a deterministic random projection matrix."""
-        key = (in_dim, out_dim)
-        if key not in self._projections:
-            # Seed based on dimensions to ensure consistency across analysis runs
-            rng = np.random.default_rng(seed=in_dim * 1000 + out_dim)
-            # Use a semi-orthogonal or simple random matrix
-            # For JL lemma preservation, a standard normal matrix scaled by 1/sqrt(out_dim) works
-            proj = rng.standard_normal((in_dim, out_dim)) / np.sqrt(out_dim)
-            self._projections[key] = proj
-        return self._projections[key]
+    def _linear_cka(self, X: np.ndarray, Y: np.ndarray) -> float:
+        """Compute Linear CKA between two activation matrices.
+        
+        CKA (Centered Kernel Alignment, Kornblith et al. 2019) is the
+        established method for comparing neural network layer representations.
+        It is invariant to isotropic scaling and orthogonal transformations.
+        
+        Args:
+            X: Activation matrix (n_samples, d1) 
+            Y: Activation matrix (n_samples, d2)
+        
+        Returns:
+            CKA similarity in [0, 1]. Values < 0.30 indicate representational
+            rupture — the successor layer has discarded the learned feature
+            subspace of its predecessor.
+        """
+        # Center the matrices
+        X = X - X.mean(axis=0, keepdims=True)
+        Y = Y - Y.mean(axis=0, keepdims=True)
+        
+        # HSIC with linear kernel: HSIC(K, L) = ||Y^T X||_F^2 / (n-1)^2
+        # Simplified: CKA = ||Y^T X||_F^2 / (||X^T X||_F * ||Y^T Y||_F)
+        YtX = Y.T @ X
+        XtX = X.T @ X
+        YtY = Y.T @ Y
+        
+        numerator = np.linalg.norm(YtX, 'fro') ** 2
+        denominator = np.linalg.norm(XtX, 'fro') * np.linalg.norm(YtY, 'fro')
+        
+        if denominator < 1e-12:
+            return 0.0
+        
+        return float(np.clip(numerator / denominator, 0.0, 1.0))
 
-    def _project(self, vec: np.ndarray, target_dim: int) -> np.ndarray:
-        """Projects vector to target dimension deterministically."""
-        if vec.shape[0] == target_dim:
-            return vec
-        proj = self._get_projection(vec.shape[0], target_dim)
-        return vec @ proj
+    def _logit_lens(self, layer_activation: np.ndarray, 
+                     unembedding_matrix: np.ndarray) -> Dict[str, float]:
+        """Project residual stream through unembedding to see layer predictions.
+        
+        Logit Lens (Nostalgebraist 2020): The most widely used single diagnostic
+        in production interpretability work. It reveals WHEN a layer actually
+        starts predicting meaningful tokens vs passing through noise.
+        
+        Args:
+            layer_activation: (batch, seq, d_model) or (seq, d_model)
+            unembedding_matrix: (d_model, vocab_size) — the final projection
+        
+        Returns:
+            Dict with top_1_confidence, top_1_entropy, top_token_id
+        """
+        if layer_activation.ndim == 3:
+            # Mean over batch, take last token position
+            act = layer_activation.mean(axis=0)[-1, :]  # (d_model,)
+        elif layer_activation.ndim == 2:
+            act = layer_activation[-1, :]  # Last position
+        else:
+            act = layer_activation
+            
+        # Project through unembedding: logits = act @ W_unembed
+        logits = act @ unembedding_matrix  # (vocab_size,)
+        
+        # Stable softmax
+        logits_safe = logits - np.max(logits)
+        exp_logits = np.exp(logits_safe)
+        probs = exp_logits / (np.sum(exp_logits) + 1e-12)
+        
+        top_id = int(np.argmax(probs))
+        top_conf = float(probs[top_id])
+        
+        # Entropy of prediction distribution
+        ent = float(-np.sum(probs * np.log(np.clip(probs, 1e-12, 1.0))))
+        max_ent = np.log(len(probs))
+        norm_ent = ent / max_ent if max_ent > 0 else 0.0
+        
+        return {
+            "top_1_confidence": round(top_conf, 6),
+            "top_token_id": top_id,
+            "normalized_entropy": round(float(norm_ent), 4),
+        }
 
-    def analyze(self, activation_tensors: Dict[str, np.ndarray], input_text: str) -> Dict[str, Any]:
+    def analyze(self, activation_tensors: Dict[str, np.ndarray], 
+                input_text: str,
+                unembedding_weights: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
         Args:
-            activation_tensors: Mapping of layer names to their outputs (batch, seq, d_model)
-            input_text: The original text that generated these activations
+            activation_tensors: Mapping of layer names to their outputs
+            input_text: The original text (kept for backward compatibility)
+            unembedding_weights: Optional (d_model, vocab_size) matrix for logit lens
         """
         report = {
-            "summary": {"sbert_model": self.model_name},
-            "layer_fidelity": {}, # Similarity to ground truth (SBERT embedding of text)
-            "layer_drift": {},    # Similarity to previous layer
+            "summary": {"method": "CKA + Logit Lens (2024 standard)"},
+            "layer_cka": {},        # CKA similarity to previous layer
+            "logit_lens": {},       # Per-layer prediction confidence
+            "layer_drift": {},      # Kept for backward compat (now = 1 - CKA)
+            "layer_fidelity": {},   # Kept for backward compat
             "issues": []
         }
         
-        if not self.sbert:
-            report["issues"].append({"severity": "info", "msg": "SBERT not available. Install sentence-transformers for semantic analysis."})
-            return report
-
-        # 1. Get Ground Truth Embedding
-        # We use SBERT to encode the original text as the "Ideal" representation
-        gt_embedding = self.sbert.encode(input_text, convert_to_numpy=True)
-        
-        prev_embedding = None
-        
-        # Sort activations by layer index if possible (heuristic: name containing 'layer' followed by numbers)
         sorted_names = sorted(activation_tensors.keys())
+        prev_act_2d = None
+        prev_name = None
+        logit_confidences = []
         
         for name in sorted_names:
             act = activation_tensors[name]
-            # Pooling: [batch, seq, d_model] -> [d_model]
-            # ONLY analyze layers with substantial hidden dimension (semantic representations)
-            # Skip gates, scalars, and biases (d_model < 16)
+            
+            # Skip gates, scalars, biases
             if act.shape[-1] < 16:
                 continue
                 
-            layer_embedding = np.mean(act, axis=tuple(range(act.ndim - 1)))
-            layer_norm = np.linalg.norm(layer_embedding)
-            
-            # Skip near-zero vectors (e.g., zero-meaned LayerNorm outputs with no bias)
-            # These are non-semantic and lead to sim=-1.00 math errors.
-            if layer_norm < 1e-6:
+            # Flatten to 2D: (n_samples, features) for CKA
+            if act.ndim >= 3:
+                # Reshape (batch, seq, d_model) → (batch*seq, d_model)
+                act_2d = act.reshape(-1, act.shape[-1])
+            elif act.ndim == 2:
+                act_2d = act
+            else:
                 continue
             
-            # Fidelity: Similarity to original input text (projected if necessary)
-            if gt_embedding is not None:
-                # Use deterministic projection if dimensions mismatch
-                proj_act = self._project(layer_embedding, gt_embedding.shape[0])
+            # Skip near-zero activations (degenerate LayerNorm outputs)
+            if np.linalg.norm(act_2d) < 1e-6:
+                continue
+            
+            # ── CKA: Layer-to-layer representational similarity ──
+            if prev_act_2d is not None:
+                # Subsample if too many tokens (CKA is O(n²) in samples)
+                max_samples = 1024
+                if act_2d.shape[0] > max_samples:
+                    idx = np.linspace(0, act_2d.shape[0] - 1, max_samples, dtype=int)
+                    a_sub = act_2d[idx]
+                    p_sub = prev_act_2d[idx] if prev_act_2d.shape[0] > max_samples else prev_act_2d
+                else:
+                    a_sub = act_2d
+                    p_sub = prev_act_2d
+                    
+                # Handle dimension mismatches by truncating to min samples
+                min_n = min(a_sub.shape[0], p_sub.shape[0])
+                cka_score = self._linear_cka(a_sub[:min_n], p_sub[:min_n])
                 
-                dot_gt = np.dot(proj_act, gt_embedding)
-                norm_gt = np.linalg.norm(proj_act) * np.linalg.norm(gt_embedding)
-                fidelity = float(dot_gt / (norm_gt + 1e-12)) 
-                report["layer_fidelity"][name] = np.clip(fidelity, -1.0, 1.0)
+                report["layer_cka"][name] = round(cka_score, 4)
+                report["layer_drift"][name] = round(1.0 - cka_score, 4)  # Backward compat
                 
-                if layer_embedding.shape != gt_embedding.shape:
-                    msg = f"Fidelity calculated via projection ({layer_embedding.shape[0]} -> {gt_embedding.shape[0]})"
-                    if msg not in [i["msg"] for i in report["issues"]]:
-                         report["issues"].append({"severity": "info", "msg": msg})
-
-            # Drift: Similarity to previous layer (projected if necessary)
-            if prev_embedding is not None:
-                # Project smaller to larger or vice-versa? 
-                # Let's project prev to current layer's dimension
-                proj_prev = self._project(prev_embedding, layer_embedding.shape[0])
-                
-                eps = 1e-12
-                dot = np.dot(layer_embedding, proj_prev)
-                norm = np.linalg.norm(layer_embedding) * np.linalg.norm(proj_prev)
-                similarity = float(dot / (norm + eps)) 
-                similarity = np.clip(similarity, -1.0, 1.0)
-                report["layer_drift"][name] = similarity
-                
-                if similarity < 0.15: # Lower threshold for cross-dim comparisons
+                if cka_score < 0.30:
                     report["issues"].append({
-                        "severity": "warning", 
-                        "msg": f"Significant semantic drift at {name} (sim={similarity:.2f})."
+                        "severity": "warning",
+                        "msg": f"Representational rupture at {name} (CKA={cka_score:.2f} < 0.30). "
+                               f"Layer discards predecessor's feature subspace."
                     })
             
-            prev_embedding = layer_embedding
-
+            # ── Logit Lens: What does the model predict at this depth? ──
+            if unembedding_weights is not None and act.shape[-1] == unembedding_weights.shape[0]:
+                lens_result = self._logit_lens(act, unembedding_weights)
+                report["logit_lens"][name] = lens_result
+                logit_confidences.append(lens_result["top_1_confidence"])
+                
+                # Backward compat: use logit confidence as "fidelity"
+                report["layer_fidelity"][name] = lens_result["top_1_confidence"]
+            
+            prev_act_2d = act_2d
+            prev_name = name
+        
+        # ── Check for monotonic confidence growth ──
+        if len(logit_confidences) >= 3:
+            # Healthy: confidence should generally increase through layers
+            decreases = 0
+            for i in range(1, len(logit_confidences)):
+                if logit_confidences[i] < logit_confidences[i-1] * 0.5:
+                    decreases += 1
+            if decreases > len(logit_confidences) * 0.3:
+                report["issues"].append({
+                    "severity": "warning",
+                    "msg": f"Logit Lens shows non-monotonic confidence: model may not be "
+                           f"learning progressively through depth."
+                })
+        
         return report

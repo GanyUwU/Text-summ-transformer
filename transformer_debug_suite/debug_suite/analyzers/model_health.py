@@ -26,8 +26,17 @@ def _entropy(attn_row: np.ndarray) -> float:
 
 
 def _classify_head(norm_ent: float, avg_dist: float, target_var: float,
-                   seq_len: int) -> str:
-    """Classify a head based on entropy, locality, and sparsity."""
+                   seq_len: int, sink_score: float = 0.0) -> str:
+    """Classify a head based on entropy, locality, sparsity, and sink score.
+    
+    Attention sinks (Xiao et al. 2023) are heads that consistently attend to
+    position 0 (BOS). They are load-bearing structural features, NOT failures.
+    """
+    # Sink detection first — these are healthy, load-bearing heads
+    if sink_score > 0.5:
+        if sink_score > 0.8 and norm_ent < 0.15:
+            return "pure_sink"
+        return "sink"
     if norm_ent > 0.80:
         return "uniform"
     if norm_ent < 0.25:
@@ -120,8 +129,11 @@ class ModelHealthAnalyzer:
                 # 4. Max weight (peak sharpness)
                 max_w = float(np.max(h_attn))
 
-                # 5. Classification
-                htype = _classify_head(norm_ent, avg_dist, target_var, seq_len)
+                # 5. Sink score (Xiao et al. 2023)
+                sink_score = float(np.mean(h_attn[:, :, 0]))
+
+                # 6. Classification (with sink awareness)
+                htype = _classify_head(norm_ent, avg_dist, target_var, seq_len, sink_score)
 
                 head_reports.append({
                     "head_idx": h,
@@ -130,6 +142,7 @@ class ModelHealthAnalyzer:
                     "avg_distance": round(avg_dist, 4),
                     "target_variance": round(target_var, 4),
                     "max_weight": round(max_w, 4),
+                    "sink_score": round(sink_score, 4),
                     "type": htype,
                 })
 
@@ -160,12 +173,17 @@ class ModelHealthAnalyzer:
         # Summary
         total = sum(l["num_heads"] for l in layers)
         type_counts = {"local": 0, "global": 0, "sparse": 0,
-                       "uniform": 0, "collapsed": 0}
+                       "uniform": 0, "collapsed": 0, "sink": 0, "pure_sink": 0}
         for layer in layers:
             for h in layer["heads"]:
+                if h["type"] not in type_counts:
+                    type_counts[h["type"]] = 0
                 type_counts[h["type"]] += 1
 
-        healthy = type_counts["local"] + type_counts["global"] + type_counts["sparse"]
+        # Sinks are healthy, load-bearing heads (Xiao et al. 2023)
+        healthy = (type_counts["local"] + type_counts["global"] +
+                   type_counts["sparse"] + type_counts["sink"] +
+                   type_counts["pure_sink"])
         health_score = (healthy / total * 100) if total > 0 else 0.0
 
         return {
@@ -222,11 +240,14 @@ class ModelHealthAnalyzer:
         for i in range(1, len(std_vals)):
             if std_vals[i - 1] > 0:
                 ratio = std_vals[i] / std_vals[i - 1]
-                if ratio > 3.0:
+                # Greg Yang's Tensor Programs: 1.5× is the warning threshold
+                # for detecting semantic melt early. Previous 3.0× was too lax.
+                if ratio > 1.5:
+                    severity = "🔴" if ratio > 3.0 else "🟡"
                     alerts.append(
-                        f"🔴 {rows[i-1]['name']} → {rows[i]['name']}: "
+                        f"{severity} {rows[i-1]['name']} → {rows[i]['name']}: "
                         f"std grew {ratio:.1f}× (gradient explosion risk)")
-                elif ratio < 0.1:
+                elif ratio < 0.3:
                     alerts.append(
                         f"🟡 {rows[i-1]['name']} → {rows[i]['name']}: "
                         f"std shrank to {ratio:.2f}× (vanishing signal risk)")

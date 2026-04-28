@@ -302,7 +302,7 @@ def main():
     print("\nTo continue training with fixes:")
     print("  python pretrain_multi.py")
     print("\nTo test again after more steps:")
-    print("  python test_encoder.py pretrain_weights_multi/pretrain_multi_best.pt")
+    print("  python test_encoder.py pretrain_weights_multi_fixed/pretrain_multi_fixed_best.pt")
 
 
 if __name__ == "__main__":

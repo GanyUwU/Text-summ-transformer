@@ -28,7 +28,17 @@ def export_model_to_onnx(checkpoint_path, output_path="pretrain_model_debug.onnx
     src_seq_len = config['src_seq_len']
     tgt_seq_len = config['tgt_seq_len']
     
-    print(f"Building model with d_model={d_model}, layers={num_layers}...")
+    print(f"Loading weights from {checkpoint_path}...")
+    checkpoint = load_checkpoint(checkpoint_path, map_location=device)
+    
+    # Auto-detect sequence lengths from checkpoint for PE compatibility
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    if 'src_pos.pe' in state_dict:
+        src_seq_len = state_dict['src_pos.pe'].shape[1]
+    if 'tgt_pos.pe' in state_dict:
+        tgt_seq_len = state_dict['tgt_pos.pe'].shape[1]
+
+    print(f"Building model with d_model={d_model}, layers={num_layers}, src_len={src_seq_len}, tgt_len={tgt_seq_len}...")
     model = build_transformer(
         src_vocab_size=src_vocab_size,
         tgt_vocab_size=tgt_vocab_size,
@@ -42,9 +52,7 @@ def export_model_to_onnx(checkpoint_path, output_path="pretrain_model_debug.onnx
         use_copy=True # Always enable for the full suite
     )
     
-    print(f"Loading weights from {checkpoint_path}...")
-    checkpoint = load_checkpoint(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(state_dict)
     model.eval()
     
     # Dummy inputs for ONNX tracer
@@ -56,8 +64,13 @@ def export_model_to_onnx(checkpoint_path, output_path="pretrain_model_debug.onnx
     dummy_encoder_mask = torch.ones((1, 1, 1, src_seq_len), dtype=torch.bool)
     dummy_decoder_mask = torch.ones((1, 1, tgt_seq_len, tgt_seq_len), dtype=torch.bool)
     
-    print(f"Exporting to {output_path}...")
-    # We export the full forward pass
+    # The model.forward() returns (final_dist, p_gen, cross_attn).
+    # We export all three as named ONNX outputs so the debug suite can
+    # access p_gen (hallucination signal) and cross_attn (alignment diagnostic) 
+    # as first-class tensors with zero graph surgery needed.
+    output_names = ['logits', 'p_gen', 'cross_attn']
+    
+    print(f"Exporting to {output_path} with outputs: {output_names}...")
     torch.onnx.export(
         model,
         (dummy_encoder_input, dummy_encoder_mask, dummy_decoder_input, dummy_decoder_mask),
@@ -66,7 +79,7 @@ def export_model_to_onnx(checkpoint_path, output_path="pretrain_model_debug.onnx
         opset_version=17, # Modern version with Softmax axis support
         do_constant_folding=True,
         input_names=['encoder_input', 'encoder_mask', 'decoder_input', 'decoder_mask'],
-        output_names=['logits'],
+        output_names=output_names,
         
         dynamic_axes={
             'encoder_input': {0: 'batch', 1: 'src_seq'},
@@ -76,7 +89,11 @@ def export_model_to_onnx(checkpoint_path, output_path="pretrain_model_debug.onnx
         }
     )
     
-    print("Export Complete! Model ready for Transformer Debug Suite.")
+    print(f"Export Complete! Model ready for Transformer Debug Suite.")
+    print(f"  Named outputs: {output_names}")
+    print(f"  - logits:     (batch, tgt_seq, vocab_size) — final blended distribution")
+    print(f"  - p_gen:      (batch, tgt_seq, 1) — pointer-generator gate probability")
+    print(f"  - cross_attn: (batch, tgt_seq, src_seq) — decoder cross-attention weights")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -85,3 +102,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     export_model_to_onnx(args.checkpoint, args.output)
+

@@ -29,8 +29,17 @@ class ActivationAnalyzer:
                 report["summary"]["issues_count"] += 1
                 continue
 
-            # 2. Sparsity (Dead Neurons check)
-            sparsity = np.mean(np.abs(act) < 1e-6)
+            # 2. Per-Neuron Dead Check (Michel et al. 2019)
+            # A neuron is dead only if its max absolute activation across ALL
+            # batch/sequence positions is near-zero. Per-element sparsity is wrong
+            # because a neuron that fires on even one example is alive.
+            if act.ndim >= 2:
+                # Reduce all axes except the last (neuron/feature dim)
+                axes_to_reduce = tuple(range(act.ndim - 1))
+                max_abs_per_neuron = np.max(np.abs(act), axis=axes_to_reduce)
+                sparsity = float(np.mean(max_abs_per_neuron < 1e-6))
+            else:
+                sparsity = np.mean(np.abs(act) < 1e-6)
             
             # 3. Variance & Saturation
             variance = np.var(act)

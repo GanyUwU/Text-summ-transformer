@@ -134,8 +134,12 @@ def smooth_nll_loss(log_probs, targets, ignore_index=0, label_smoothing=0.0, smo
         return loss_fn(log_probs_flat, targets_flat)
 
 
-def pgen_balance_loss(p_gen: torch.Tensor, target: float = 0.5):
-    """Sequence-level MSE-based p_gen penalty. Allows token variance."""
-    return ((p_gen.mean(dim=1) - target) ** 2).mean()
+def force_generation_loss(p_gen: torch.Tensor, eps: float = 1e-12, alpha: float = 0.5):
+    """
+    Asymmetric softened penalty for low p_gen (high copying).
+    Uses -alpha * log(p_gen) to create a controlled gradient push away from 0.0.
+    """
+    # p_gen: [B, T]
+    return -alpha * torch.log(p_gen + eps).mean()
 
 

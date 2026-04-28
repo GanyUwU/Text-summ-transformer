@@ -11,8 +11,8 @@ print("="*70)
 print("PRETRAINING FAILURE ANALYSIS")
 print("="*70)
 
-ckpt_best = torch.load('pretrain_weights_100k/pretrain_best.pt', map_location='cpu', weights_only=False)
-ckpt_final = torch.load('pretrain_weights_100k/pretrain_final.pt', map_location='cpu', weights_only=False)
+ckpt_best = torch.load('pretrain_weights_100k/pretrain_best.pt', map_location='cpu')
+ckpt_final = torch.load('pretrain_weights_100k/pretrain_final.pt', map_location='cpu')
 
 best_step = ckpt_best.get('step', 'N/A')
 best_loss = ckpt_best.get('best_loss', 'N/A')

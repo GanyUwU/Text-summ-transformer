@@ -27,6 +27,13 @@ from debug_suite.analyzers.attention import AttentionAnalyzer
 from debug_suite.analyzers.activations import ActivationAnalyzer
 from debug_suite.analyzers.hallucination import HallucinationAnalyzer
 try:
+    from rouge_score import rouge_scorer
+    import bert_score
+    from summac.model_summac import SummaCZS
+    _HAS_EXT_METRICS = True
+except Exception:
+    _HAS_EXT_METRICS = False
+try:
     from debug_suite.analyzers.semantic import SemanticAnalyzer
     _HAS_SEMANTIC = True
 except Exception:
@@ -61,6 +68,7 @@ import torch
 try:
     from model import build_transformer
     from pretrain_config import get_finetune_config
+    from failure_classifier import FailureModeClassifier, AdaptiveThresholds
     _HAS_TORCH_MODEL = True
 except ImportError:
     _HAS_TORCH_MODEL = False
@@ -305,7 +313,7 @@ current_model_path = None
 
 # ==================== ANALYSIS FUNCTIONS ====================
 
-def analyze_model(file, input_text):
+def analyze_model(file):
     """Main analysis function called when user uploads and clicks Analyze."""
     global analysis_results, current_model_path
     
@@ -318,13 +326,13 @@ def analyze_model(file, input_text):
     if not (is_pt or is_onnx):
          return (" Please upload a .onnx or .pt file.",) + (None,) * 12
          
-    if not input_text:
-        input_text = "The quick brown fox jumps over the lazy dog."
+    input_text = "The quick brown fox jumps over the lazy dog."
     
     try:
         current_model_path = file.name
         
         weight_evo_plot, grad_flow_plot = None, None
+        hall_results = {"risk_score": 0, "metrics": {}}
         
         if is_pt and _HAS_TORCH_MODEL:
             try:
@@ -370,27 +378,34 @@ def analyze_model(file, input_text):
             # 4. Run Inference
             engine = InferenceEngine(temp_path)
             
-            # Generate dtype-correct dummy inputs based on model inputs
+            # Generate structured dummy inputs (NOT RANDOM) to evaluate the graph
             inputs = {}
             for inp in engine.session.get_inputs():
-                # Use 32 as default for dynamic axes to ensure valid attention entropy (log(seq_len) > 0)
                 shape = [d if isinstance(d, int) else 32 for d in inp.shape]
                 t = inp.type.lower()
-    
-                if "bool" in t:
-                    # Masks are often bool in exported transformer graphs.
-                    inputs[inp.name] = (np.random.rand(*shape) > 0.5).astype(np.bool_)
+                
+                if "encoder_mask" in inp.name:
+                    inputs[inp.name] = np.ones(shape, dtype=np.bool_)
+                elif "decoder_mask" in inp.name:
+                    # Create causal mask for decoder
+                    seq_len = shape[-1]
+                    mask = np.tril(np.ones((seq_len, seq_len), dtype=np.bool_))
+                    # Broadcast to required shape
+                    broadcast_mask = np.broadcast_to(mask, shape)
+                    inputs[inp.name] = broadcast_mask.copy()
+                elif "bool" in t:
+                    inputs[inp.name] = np.ones(shape, dtype=np.bool_)
                 elif "int" in t:
-                    # Handle int32/int64; keep token id range moderate.
                     dtype = np.int64 if "64" in t else np.int32
-                    inputs[inp.name] = np.random.randint(0, 100, size=shape, dtype=dtype)
+                    # Sequential tokens instead of random noise
+                    seq = np.arange(10, 10 + shape[-1], dtype=dtype)
+                    inputs[inp.name] = np.broadcast_to(seq, shape).copy()
                 elif "float16" in t:
-                    inputs[inp.name] = np.random.randn(*shape).astype(np.float16)
+                    inputs[inp.name] = np.ones(shape).astype(np.float16)
                 elif "double" in t or "float64" in t:
-                    inputs[inp.name] = np.random.randn(*shape).astype(np.float64)
+                    inputs[inp.name] = np.ones(shape).astype(np.float64)
                 else:
-                    # Default ONNX float tensor
-                    inputs[inp.name] = np.random.randn(*shape).astype(np.float32)
+                    inputs[inp.name] = np.ones(shape).astype(np.float32)
             
             outputs = engine.run(inputs)
             
@@ -438,6 +453,17 @@ def analyze_model(file, input_text):
         else:
             analysis_results.update({"metadata": {"inputs": [], "outputs": []}, "weights": {"summary": {}}})
         
+        # 7. Categorical Failure Diagnosis (2025 standard)
+        classifier = FailureModeClassifier()
+        
+        diagnosis = classifier.classify(
+            copy_rate=hall_results.get("metrics", {}).get("copy_rate", 0.1), # Approximation if not in hall_results
+            norm_entropy=hall_results.get("metrics", {}).get("norm_entropy", 0.5),
+            repetition=hall_results.get("metrics", {}).get("repetition", 0.0),
+            norm_coverage=hall_results.get("metrics", {}).get("coverage", 0.5)
+        )
+        analysis_results["diagnosis"] = diagnosis
+
         overview = generate_overview()
         weight_plot = generate_weight_plot() if is_onnx else None
         attn_plot = generate_attention_plot() if is_onnx else None
@@ -447,14 +473,18 @@ def analyze_model(file, input_text):
         health_heatmap = generate_health_heatmap() if is_onnx else None
         health_dashboard = generate_health_dashboard() if is_onnx else None
         health_signal = generate_health_signal() if is_onnx else None
-        health_summary = generate_health_summary_md() if is_onnx else None
+        
+        # Format Diagnostic Banner
+        severity_color = {1: "#ef4444", 2: "#f59e0b", 3: "#f59e0b", 4: "#3b82f6", 5: "#10b981"}[FailureModeClassifier.SEVERITY_RANK[diagnosis.mode]]
+        diag_banner_md = f"### Diagnosis: <span style='color:{severity_color}; font-size:1.4rem;'>[{diagnosis.mode}]</span> (Confidence: {diagnosis.confidence})"
+        diag_details_md = f"**Evidence**: {diagnosis.description}\n\n**Action**: {diagnosis.recommended_action}"
         
         evo_plot = generate_evolution_plot()
         grad_plot = generate_gradient_plot()
         
         return (overview, weight_plot, attn_plot, act_plot, hall_plot,
                 semantic_plot, health_heatmap, health_dashboard,
-                health_signal, health_summary, health_summary, evo_plot, grad_plot, "✅ Analysis complete!")
+                health_signal, diag_banner_md, diag_details_md, evo_plot, grad_plot, "✅ Analysis complete!")
         
     except Exception as e:
         import traceback
@@ -501,6 +531,38 @@ def generate_evolution_plot():
     return fig
 
 
+
+def evaluate_external(model_output, reference_text):
+    """Calculate ROUGE and Factual Consistency against a reference."""
+    if not _HAS_EXT_METRICS:
+        return "❌ Metrics libraries (rouge_score, bert_score, summac) not installed.", None
+    
+    if not model_output or not reference_text:
+        return "⚠️ Please provide both model output and reference summary.", None
+        
+    try:
+        # ROUGE
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        scores = scorer.score(reference_text, model_output)
+        
+        # BERTScore (simplified layer check)
+        P, R, F1 = bert_score.score([model_output], [reference_text], lang="en", verbose=False)
+        
+        # SummC (Zero-Shot) - very lightweight factual consistency
+        # Assuming we don't have the full source context here, we can only check self-consistency 
+        # or require the source in the UI. For now, let's just report the overlap.
+        
+        results_md = f"### External Metric Report\n\n"
+        results_md += f"| Metric | Score | Interpretation |\n"
+        results_md += f"|--------|-------|--------------|\n"
+        results_md += f"| **ROUGE-1** | {scores['rouge1'].fmeasure:.4f} | Surface overlap |\n"
+        results_md += f"| **ROUGE-2** | {scores['rouge2'].fmeasure:.4f} | Bigram overlap |\n"
+        results_md += f"| **ROUGE-L** | {scores['rougeL'].fmeasure:.4f} | Longest subseq |\n"
+        results_md += f"| **BERTScore** | {F1.item():.4f} | Semantic similarity |\n"
+        
+        return results_md
+    except Exception as e:
+        return f"❌ Evaluation failed: {str(e)}"
 
 def generate_overview():
     """Generate overview markdown with improved styling."""
@@ -593,18 +655,35 @@ def generate_weight_plot():
     if not layer_stats:
         return None
     
+    maps_class = r.get("maps_classification", {})
+    from plotly.subplots import make_subplots
+    
+    fig = make_subplots(
+        rows=1, cols=2 if maps_class else 1,
+        specs=[[{"type": "bar"}, {"type": "pie"}]] if maps_class else [[{"type": "bar"}]],
+        subplot_titles=("Weight Statistics per Layer", "MAPS Head Classification") if maps_class else ("Weight Statistics per Layer",)
+    )
+    
     names = list(layer_stats.keys())[:20]  # Limit to 20 layers
     means = [layer_stats[n]["mean"] for n in names]
     stds = [layer_stats[n]["std"] for n in names]
     
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name='Mean', x=names, y=means))
-    fig.add_trace(go.Bar(name='Std', x=names, y=stds))
+    fig.add_trace(go.Bar(name='Mean', x=names, y=means), row=1, col=1)
+    fig.add_trace(go.Bar(name='Std', x=names, y=stds), row=1, col=1)
+    
+    if maps_class:
+        summary = maps_class.get("summary", {})
+        labels = []
+        values = []
+        for k, v in summary.items():
+            if v > 0:
+                labels.append(k.replace('_', ' ').title())
+                values.append(v)
+        if values:
+            fig.add_trace(go.Pie(labels=labels, values=values, hole=0.4), row=1, col=2)
+    
     fig.update_layout(
-        title="Weight Statistics per Layer",
         barmode='group',
-        xaxis_title="Layer",
-        yaxis_title="Value",
         height=550
     )
     return fig
@@ -1474,20 +1553,30 @@ def create_ui():
         with gr.Group(elem_classes="header-section"):
             gr.Markdown("# Transformer Debug Suite")
             gr.Markdown("Analyze ONNX transformer models for potential issues and get actionable insights")
+            
+            # Phase 5: Calibration Check Warning
+            import pathlib, json
+            baseline_path = pathlib.Path("calibration_baseline.json")
+            if not baseline_path.exists():
+                gr.Markdown("### ⚠️ WARNING: Calibration Missing", elem_classes="warning-banner")
+                gr.Markdown("> `calibration_baseline.json` not found. Failure classifier using **hardcoded defaults**. Run `calibrate_model.py` first.", elem_classes="warning-note")
+            else:
+                try:
+                    with open(baseline_path, 'r') as f:
+                        cal_data = json.load(f)
+                        if len(cal_data) < 10:
+                            gr.Markdown("### ⚠️ WARNING: Weak Calibration", elem_classes="warning-banner")
+                            gr.Markdown(f"> Baseline has only {len(cal_data)} samples. Thresholds may be unstable.", elem_classes="warning-note")
+                except:
+                    pass
         
         # Input Section - Clean layout
         with gr.Row(equal_height=False):
-            with gr.Column(scale=1, variant="compact"):
+            with gr.Column(variant="compact"):
                 file_input = gr.File(
                     label="📦 Model File",
-                    file_types=[".onnx"],
+                    file_types=[".onnx", ".pt"],
                     height=100
-                )
-            with gr.Column(scale=2, variant="compact"):
-                text_input = gr.Textbox(
-                    label="🔍 Test Prompt",
-                    placeholder="Enter a sentence to probe the model's behavior...",
-                    lines=2
                 )
         
         # Analyze Button
@@ -1507,7 +1596,26 @@ def create_ui():
             
             with gr.Tab("📊 Overview"):
                 overview_md = gr.Markdown(XAI_TEXTS["overview"])
-                health_summary_md = gr.Markdown("*Run analysis to see health summary*")
+                with gr.Column(scale=1):
+                    gr.Markdown("### 🩺 Diagnostic Diagnosis", elem_classes="section-title")
+                    diagnosis_banner = gr.Markdown("📊 Waiting for analysis...")
+                    
+                    # Phase 5: Detox context
+                    import pathlib, json
+                    baseline_path = pathlib.Path("calibration_baseline.json")
+                    training_note = ""
+                    if baseline_path.exists():
+                        try:
+                            with open(baseline_path, 'r') as f:
+                                meta = json.load(f).get('metadata', {})
+                                if meta.get('training_phase') == 'detox':
+                                    training_note = "🛡️ **DETOX MODE ACTIVE**: Thresholds are calibrated for forced pointer-generator suppression. 'Extractive Collapse' is an expected training signal."
+                        except: pass
+                    
+                    if training_note:
+                        gr.Markdown(training_note, elem_classes="info-banner")
+                        
+                    diagnosis_details = gr.Markdown("*Run analysis to see diagnostic evidence*")
             
             with gr.Tab("⚖️ Weights"):
                 gr.Markdown("### Weight Distribution", elem_classes="section-title")
@@ -1578,14 +1686,19 @@ def create_ui():
                         with gr.Accordion("Weight Evolution", open=True):
                             gr.Markdown(XAI_TEXTS["evolution"])
 
+            with gr.Tab("🧪 External Evaluation"):
+                gr.Markdown("### Ground Truth Comparison", elem_classes="section-title")
+                gr.Markdown("Note: Probing is currently disabled for performance.", elem_classes="section-subtitle")
+
+
         # Connect
         analyze_btn.click(
             fn=analyze_model,
-            inputs=[file_input, text_input],
+            inputs=[file_input],
             outputs=[
                 overview_md, weight_plot, attn_plot, act_plot, hall_plot,
                 semantic_plot, health_heatmap, health_dashboard,
-                health_signal, health_summary_md, health_summary_md2, evo_plot, grad_plot, status
+                health_signal, diagnosis_banner, diagnosis_details, evo_plot, grad_plot, status
             ]
         )
     

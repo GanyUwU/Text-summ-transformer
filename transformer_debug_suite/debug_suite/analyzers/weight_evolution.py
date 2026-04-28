@@ -99,14 +99,29 @@ class WeightEvolutionAnalyzer:
         }
 
     def _check_frozen(self, data, prefix):
-        """Checks if a component's weights are hardly moving."""
-        dists = []
+        """Checks if a component's weights are hardly moving.
+        
+        Frozen threshold scales with sqrt(num_params) of the layer.
+        For 512×512 weight matrices: threshold ≈ 0.001.
+        Fixed 1e-4 was too aggressive and flagged healthy training as frozen.
+        """
+        frozen_layers = 0
+        total_layers = 0
         for name, stats in data.items():
             if name.startswith(prefix) and len(stats["l2_dist_from_prev"]) > 1:
-                # Average distance excluding the first one (which is 0.0)
-                dists.append(np.mean(stats["l2_dist_from_prev"][1:]))
-        if not dists: return False
-        return np.mean(dists) < 1e-4
+                avg_dist = np.mean(stats["l2_dist_from_prev"][1:])
+                # Dynamic threshold: scale with sqrt(num_params)
+                # For a [512, 512] matrix: sqrt(262144) ≈ 512, threshold ≈ 0.001
+                # This prevents falsely flagging healthy training as frozen.
+                num_params = 1
+                for d in (stats.get("shape", [512, 512])):
+                    num_params *= d
+                threshold = 1.0 / np.sqrt(max(num_params, 1)) * 0.5
+                total_layers += 1
+                if avg_dist < threshold:
+                    frozen_layers += 1
+        if total_layers == 0: return False
+        return frozen_layers > (total_layers * 0.5)  # Frozen if >50% of layers are stuck
 
     def _calculate_avg_movement(self, data, prefix):
         dists = []

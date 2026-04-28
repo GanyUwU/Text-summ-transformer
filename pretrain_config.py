@@ -99,7 +99,7 @@ def get_finetune_config():
         
         # Sequence lengths
         "src_seq_len": 512,
-        "tgt_seq_len": 100, 
+        "tgt_seq_len": 100,   # Reduced for XSum/SAMSum conciseness
         
         # Training (from-scratch: higher LR + more epochs)
         # Training
@@ -119,12 +119,16 @@ def get_finetune_config():
         "train_samples": 50000,      # Faster iterations (was 200k)
         "val_samples": 200,
         
-        "datasource": "cnn_dailymail", # Fallback for dataset loading logic
+        "datasource": "cnn_dailymail",
         "dataset_version": "3.0.0",
         
         # Phase 11: Nuclear Option (Start from RAW Uncorrupted Weights)
         "pretrain_weights": "pretrain_weights_multi_fixed/pretrain_multi_fixed_best.pt",
         "preload": None,
+        # Inside get_finetune_config()
+        #"pretrain_weights": "/kaggle/input/datasets/ppbbb1123/trail-transformer/nuclear_summarizer_epoch_4.pt",
+        #"tokenizer_model": "/kaggle/input/datasets/ppbbb1123/trail-transformer/tokenizer_sp.model",
+
         
         # Evaluation & Diagnostics
         "save_every": 500,           # High-frequency validation (~5 times per epoch)
@@ -138,12 +142,13 @@ def get_finetune_config():
         "entropy_reg_weight": 0.002,   # High diversity pressure (Initial Detox)
         "target_entropy": 1.6,         
         "lead_mask_prob": 0.9,         # High feature starvation (Force unlearning)
-        "decoder_lr_scale": 10.0,      # High decoder mobility
+        "decoder_lr_scale": 2.0,      # Stabilized from 10.0
         
         # Checkpointing
         "model_folder": "weights_v11_nuclear",
         "model_basename": "nuclear_summarizer_",
         "experiment_name": "runs/train_v11_nuclear_final",
+        
         
         "beam_size": 4,
         "length_penalty": 1.0,       # Concise (Phase 10)
@@ -155,9 +160,9 @@ def get_finetune_config():
         # AGGRESSIVE LINEAR PENALTY for copying (replaces MSE-based pgen_balance_loss)
         "lambda_p": 3.0,  # HIGH multiplier on mean(1 - p_gen); increase if copy rate stays high
         # HARD POINTER DROPOUT: force p_gen = 1.0 for ~20% of batches (breaks copying shortcut)
-        "hard_pointer_dropout_prob": 0.2,
+        "hard_pointer_dropout_prob": 0.3, # Increased from 0.2 to safely break identity map
         # GENERATOR WARMUP: disable copy mechanism for first N steps
-        "copy_warmup_steps": 800,  # ~1 Epoch for 50k samples (was 2000)
+        "copy_warmup_steps": 1200,  # Increased for surgical detox stability
         # Pointer-dropout (legacy; superseded by hard_pointer_dropout_prob)
         "pointer_dropout": 0.0,
         # Scheduling
@@ -167,14 +172,10 @@ def get_finetune_config():
         "enable_cockpit": False,
         "cockpit_out": "diagnostics_output/cockpit",
         "reinit_decoder_heads": False,  # Preserve specialized heads from Step 25k
-        # Phase 10: Anchor Restoration Mix (CNN/DM + XSum mix)
-        "dataset_mix": [
-            {"name": "cnn_dailymail", "version": "3.0.0", "fraction": 1.0},  # 50k (factual grounding)
-            #{"name": "xsum", "fraction": 0.3},                               # 40k (extreme abstraction)
-            #{"name": "knkarthick/samsum", "fraction": 0.1},                 # 10k (Dialogue)
-        ],
+        # Dataset mix disabled, using pure CNN/DailyMail
+        "dataset_mix": None,
         # Staged unfreeze: keep encoder effectively frozen and ramp its LR over this many steps
-        "freeze_encoder_steps": 400,  # ~0.5 Epoch for 50k samples (was 1000)
+        "freeze_steps": 400,  # ~0.5 Epoch for 50k samples (was 1000)
         "staged_unfreeze": True,
     }   
 #         # Diagnostics (from reviewer's checklist)
